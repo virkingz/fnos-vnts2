@@ -2,6 +2,11 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+> **命名说明**：项目/仓库/制品名为 `fnos-vnts2`（fpk 文件、Docker 镜像）；
+> 飞牛包名内 `appname = vnts-nas`，故安装路径为 `/var/apps/vnts-nas/`、
+> 网关前缀为 `/app/vnts-nas`。两者刻意不同，便于与其他 `fnos-*` 项目命名统一，
+> 同时不影响既有安装路径。
+
 ## [1.0.0] - 2026-11-18
 
 首个版本。
