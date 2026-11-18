@@ -1,0 +1,21 @@
+#!/bin/bash
+# 安装前：环境探测。只警告、不阻断安装。
+: "${TRIM_TEMP_LOGFILE:=/tmp/vnts-nas-install-init.log}"
+
+LOG="${TRIM_TEMP_LOGFILE%/*}/install_init.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+{
+    echo "=== $(date '+%Y-%m-%d %H:%M:%S') install_init ==="
+    echo "arch=$(uname -m)"
+    echo "tun_device=$([ -e /dev/net/tun ] && echo yes || echo no)"
+    echo "kernel=$(uname -r)"
+} >> "$LOG" 2>/dev/null
+
+case "$(uname -m)" in
+x86_64 | amd64 | aarch64 | arm64 | armv7l | armv6l) ;;
+*)
+    echo "注意：当前架构 $(uname -m) 可能没有 vnts 官方预编译包。" >> "$LOG"
+    ;;
+esac
+
+exit 0

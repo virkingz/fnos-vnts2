@@ -1,0 +1,22 @@
+#!/bin/bash
+# 卸载后：按用户选择决定是否保留数据目录。
+# 日志目录若被用户设到数据目录之外，此处不主动删除（避免误删外部路径）。
+set -u
+
+: "${TRIM_PKGVAR:=/var/apps/vnts-nas/var}"
+: "${TRIM_PKGTMP:=/var/apps/vnts-nas/tmp}"
+: "${TRIM_TEMP_LOGFILE:=${TRIM_PKGTMP}/error.log}"
+
+ACTION="${wizard_data_action:-keep}"
+
+if [ "$ACTION" = "delete" ]; then
+    rm -rf "${TRIM_PKGVAR}/bin" \
+           "${TRIM_PKGVAR}/server" \
+           "${TRIM_PKGVAR}/cache" \
+           "${TRIM_PKGVAR}/log" \
+           "${TRIM_PKGVAR}"/*.pid \
+           "${TRIM_PKGVAR}/ports.env" \
+           "${TRIM_PKGVAR}/logdir" 2>/dev/null || true
+fi
+
+exit 0

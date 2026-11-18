@@ -1,0 +1,19 @@
+#!/bin/bash
+# 配置变更前：停止运行，等待配置应用后再由用户/系统启动。
+set -u
+
+: "${TRIM_APPDEST:=/var/apps/vnts-nas/target}"
+: "${TRIM_PKGVAR:=/var/apps/vnts-nas/var}"
+: "${TRIM_PKGETC:=/var/apps/vnts-nas/etc}"
+: "${TRIM_PKGTMP:=/var/apps/vnts-nas/tmp}"
+: "${TRIM_TEMP_LOGFILE:=${TRIM_PKGTMP}/error.log}"
+: "${TRIM_APPNAME:=vnts-nas}"
+
+LIB="${TRIM_APPDEST}/shell/lib.sh"
+[ -f "$LIB" ] || exit 0
+# shellcheck disable=SC1090
+. "$LIB"
+
+vnt_paths
+vnt_stop_core || true
+exit 0

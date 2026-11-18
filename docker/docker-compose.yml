@@ -1,0 +1,72 @@
+# vnts-nas 一键部署
+#
+# 【本地构建并运行】
+#   cd docker && docker compose up -d
+#
+# 【直接用 CI 构建好的镜像】
+#   把 build: 三段整体注释掉，并把 image: 改成：
+#     image: ghcr.io/virkingz/vnts2-fnos:latest
+#
+# 端口说明：
+#   19098/tcp  管理页（含内嵌控制台）
+#   29872/tcp  组网服务 TCP over TLS（客户端连接用）
+#   29872/udp  组网服务 QUIC（客户端连接用）
+#   29071/tcp  控制台内部端口，仅容器内回环，无需对外映射
+#
+# 【日志与配置分离 —— 迁移时不带日志】
+#   本编排把数据与日志拆成两个卷：
+#     vnts-data  -> /data       配置 + 数据库 + 核心   ← 迁移只拷这个
+#     vnts-logs  -> /data/log   日志（LOG_DIR 指向它） ← 迁移不需要
+#   若不想要独立日志卷，可删掉 LOG_DIR 与 vnts-logs 卷，
+#   日志就会落在 /data/log（仍在数据卷内，但依然与配置分离）。
+
+services:
+  vnts-nas:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: vnts-nas:latest
+    container_name: vnts-nas
+    restart: unless-stopped
+
+    ports:
+      # 管理页。只想本机访问就把左边改成 127.0.0.1:19098
+      - "19098:19098"
+      # 组网服务：TCP 与 UDP 同号，必须两个都放行，否则客户端打洞失败
+      - "29872:29872/tcp"
+      - "29872:29872/udp"
+
+    environment:
+      TZ: Asia/Shanghai
+      # 首次启动自动下载 vnts2 核心
+      AUTO_DOWNLOAD_CORE: "1"
+      # 日志目录：独立于数据目录。设了它，日志不会落进 /data 顶层
+      LOG_DIR: "/data/log"
+      # 管理页在容器内的绑定地址。容器内必须 0.0.0.0，
+      # 否则端口映射到宿主机后从容器外访问不到。
+      # 要限制访问范围请改上面的 ports，不要改这里。
+      # PANEL_BIND: "0.0.0.0"
+
+      # 以下均为「按需启用」：留空/注释即不覆盖，沿用管理页里改过的值。
+      # PANEL_PORT: "19098"
+      # SERVICE_PORT: "29872"
+      # PANEL_TOKEN: ""                     # 留空则首次启动自动生成
+      # MIRROR: "https://ghfast.top"        # 下载慢就填镜像前缀
+      # PROXY: "socks5h://192.168.1.10:1080" # 注意容器内 127.0.0.1 指容器自己
+
+    volumes:
+      # 配置 + 数据库 + 核心 —— 迁移只需备份这个卷
+      - vnts-data:/data
+      # 日志 —— 独立卷，迁移时不带走
+      - vnts-logs:/data/log
+
+    healthcheck:
+      test: ["CMD", "/app/docker/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+volumes:
+  vnts-data:
+  vnts-logs:

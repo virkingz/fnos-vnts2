@@ -1,0 +1,51 @@
+#!/bin/bash
+# 安装后：初始化目录、保存端口、生成默认服务端配置。
+# 核心不在此阶段下载（管理页可操作），避免网络问题导致装不上。
+
+: "${TRIM_APPDEST:=/var/apps/vnts-nas/target}"
+: "${TRIM_PKGVAR:=/var/apps/vnts-nas/var}"
+: "${TRIM_PKGETC:=/var/apps/vnts-nas/etc}"
+: "${TRIM_PKGTMP:=/var/apps/vnts-nas/tmp}"
+: "${TRIM_TEMP_LOGFILE:=${TRIM_PKGTMP}/error.log}"
+: "${TRIM_APPNAME:=vnts-nas}"
+
+LIB="${TRIM_APPDEST}/shell/lib.sh"
+if [ ! -f "$LIB" ]; then
+    echo "缺少组件: ${LIB}" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$LIB"
+
+vnt_paths
+vnt_ensure_dirs
+
+vnt_port_ok() {
+    case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+: "${wizard_web_port:=${PANEL_PORT_DEFAULT}}"
+vnt_port_ok "${wizard_web_port}" || wizard_web_port="${PANEL_PORT_DEFAULT}"
+PANEL_PORT="${wizard_web_port}"
+
+: "${wizard_service_port:=${SERVICE_PORT_DEFAULT}}"
+vnt_port_ok "${wizard_service_port}" || wizard_service_port="${SERVICE_PORT_DEFAULT}"
+SERVICE_PORT="${wizard_service_port}"
+
+if [ "${PANEL_PORT}" = "${SERVICE_PORT}" ]; then
+    vnt_log "install_callback: 两端口相同，组网服务端口回退默认"
+    SERVICE_PORT="${SERVICE_PORT_DEFAULT}"
+fi
+
+CONSOLE_PORT="${CONSOLE_PORT_DEFAULT}"
+vnt_save_ports
+
+# 生成默认服务端配置（config.toml + logs/log4rs.yaml）
+vnt_render_server_config && vnt_log "install_callback: config.toml 已生成" \
+    || vnt_log "install_callback: WARN 配置生成失败，可在管理页保存设置重试"
+
+vnt_log "install_callback: done. 核心待用户在管理页下载"
+exit 0

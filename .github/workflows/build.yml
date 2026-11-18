@@ -1,0 +1,104 @@
+name: build-fpk
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+# 默认收紧；各作业按需提升。
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    # 附加 Release 需要写 contents 权限，否则报
+    # 「Resource not accessible by integration」(403)。
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成图标
+        run: python3 scripts/gen_icons.py
+
+      - name: 跑测试
+        run: |
+          python3 scripts/test_e2e.py
+          python3 scripts/test_import_export.py
+          python3 scripts/test_console.py
+          python3 scripts/test_console_real.py
+          python3 scripts/test_concurrency.py
+
+      - name: 校验资源路径改写（用真实 Vite 算法）
+        run: node scripts/probe_vite_url.js
+
+      - name: 打包 fpk
+        run: bash scripts/pack.sh
+
+      - name: 校验产物
+        run: |
+          ls -lh vnts-nas.fpk
+          tar tzf vnts-nas.fpk | head -20
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnts-nas-fpk
+          path: vnts-nas.fpk
+
+      - name: 附加到 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          # 若该 tag 已有 Release（如手工建过），则复用并只补附件，不重复创建。
+          files: vnts-nas.fpk
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+
+  docker:
+    # 多架构构建走 QEMU，较慢，因此只在打 tag 或手工触发时执行。
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 QEMU（多架构）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        run: |
+          # tag 推送用版本号，其它情况用 latest
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tags=ghcr.io/${GITHUB_REPOSITORY_OWNER}/vnts2-fnos:${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "tags_latest=ghcr.io/${GITHUB_REPOSITORY_OWNER}/vnts2-fnos:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=ghcr.io/${GITHUB_REPOSITORY_OWNER}/vnts2-fnos:edge" >> "$GITHUB_OUTPUT"
+            echo "tags_latest=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建并推送多架构镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.meta.outputs.tags_latest }}

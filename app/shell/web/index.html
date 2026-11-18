@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VNT 服务端</title>
+<link rel="icon" href="icon.png">
+<script>
+  // 管理页令牌：存在 localStorage，脚本加载时注入到请求头
+  window.__PANEL__ = { token: localStorage.getItem('panel_token') || '' };
+</script>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="icon.png" alt="">
+      <div>
+        <div class="brand-title">VNT 服务端</div>
+        <div class="brand-sub">vnts2 管理壳</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <a class="nav-item active" data-tab="overview"><span class="ic">◈</span>总览</a>
+      <a class="nav-item" data-tab="core"><span class="ic">⤓</span>核心更新</a>
+      <a class="nav-item" data-tab="settings"><span class="ic">⚙</span>服务端设置</a>
+      <a class="nav-item" data-tab="backup"><span class="ic">⇅</span>配置导入导出</a>
+      <a class="nav-item" data-tab="console"><span class="ic">▤</span>控制台</a>
+      <a class="nav-item" data-tab="logs"><span class="ic">≡</span>日志</a>
+    </nav>
+
+    <div class="side-foot" id="sideStatus"></div>
+  </aside>
+
+  <main class="main">
+
+    <!-- 总览 -->
+    <section class="tab" id="tab-overview">
+      <h1>总览</h1>
+      <div class="cards" id="ovCards"></div>
+      <div class="panel">
+        <h2>使用流程</h2>
+        <ol class="steps">
+          <li>「核心更新」下载并启动 vnts2 核心</li>
+          <li>「服务端设置」配置网段、白名单、管理员账号</li>
+          <li>「控制台」创建网络编号、管理设备与白名单</li>
+          <li>客户端填入 <b>本机地址:组网服务端口</b> 与相同组网编号/密码即可互联</li>
+        </ol>
+        <div class="tips">
+          <b>客户端连接地址</b>：<code id="ovAddr">-</code>
+          <button class="btn tiny" id="copyAddr">复制</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 核心更新 -->
+    <section class="tab hidden" id="tab-core">
+      <h1>核心更新</h1>
+      <div class="panel">
+        <div class="row">
+          <div>
+            <div class="kv"><span>当前版本</span><b id="coreCur">-</b></div>
+            <div class="kv"><span>最新版本</span><b id="coreLatest">未查询</b></div>
+            <div class="kv"><span>运行状态</span><b id="coreRun">-</b></div>
+            <div class="kv"><span>CPU 架构</span><b id="coreArch">-</b></div>
+          </div>
+          <div class="btncol">
+            <button class="btn" id="btnCheck">检查更新</button>
+            <button class="btn primary" id="btnDownload">下载核心</button>
+            <button class="btn" id="btnStart">启动核心</button>
+            <button class="btn" id="btnStop">停止核心</button>
+          </div>
+        </div>
+        <div class="prog hidden" id="coreProg"><div class="bar"><i></i></div><span>下载中…</span></div>
+      </div>
+
+      <div class="panel">
+        <h2>手动上传核心</h2>
+        <p class="muted">网络不通或想指定版本时使用。到
+          <a href="https://github.com/vnt-dev/vnts/releases" target="_blank" rel="noopener">Releases</a>
+          下载对应架构的 <code>vnts2-&lt;架构&gt;-unknown-linux-musl-v&lt;版本&gt;</code> 文件（无扩展名）。</p>
+        <div class="row">
+          <input type="file" id="coreFile">
+          <input type="text" id="coreVer" placeholder="版本号（可留空，自动识别）" class="inp">
+          <button class="btn" id="btnUpload">上传并安装</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>下载源与代理</h2>
+        <div class="field">
+          <label>镜像前缀</label>
+          <input type="text" id="mirror" class="inp" placeholder="https://ghfast.top（留空直连 GitHub）">
+        </div>
+        <div class="field">
+          <label>网络代理</label>
+          <input type="text" id="proxy" class="inp" placeholder="socks5h://127.0.0.1:1080 或 http://127.0.0.1:7890">
+        </div>
+        <div class="row">
+          <button class="btn" id="btnSaveNet">保存</button>
+          <button class="btn" id="btnTest">测试连通性</button>
+          <span class="muted" id="testResult"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 服务端设置 -->
+    <section class="tab hidden" id="tab-settings">
+      <h1>服务端设置</h1>
+      <div class="panel">
+        <h2>网络参数</h2>
+        <div class="field">
+          <label>默认虚拟网段</label>
+          <input type="text" id="sNetwork" class="inp" placeholder="10.26.0.0/24">
+          <div class="hint">新网络编号使用的默认网段（IPv4 CIDR）</div>
+        </div>
+        <div class="field">
+          <label>网络编号白名单</label>
+          <input type="text" id="sWhite" class="inp" placeholder="1001,1002（留空 = 允许任意编号加入）">
+          <div class="hint">逗号分隔。非空时只有列表内的编号才能加入</div>
+        </div>
+        <div class="field">
+          <label>IP 租约时长（秒）</label>
+          <input type="number" id="sLease" class="inp" placeholder="86400">
+          <div class="hint">离线超过该时长的设备，虚拟 IP 会被回收</div>
+        </div>
+        <div class="field">
+          <label>自定义网段（每行一个：编号=网段）</label>
+          <textarea id="sCustom" class="inp mono" rows="4" placeholder="1001=10.25.0.0/24"></textarea>
+        </div>
+        <label class="chk"><input type="checkbox" id="sPersist"> 启用数据持久化（网络/设备记录写入 SQLite）</label>
+      </div>
+
+      <div class="panel">
+        <h2>控制台管理员</h2>
+        <div class="field">
+          <label>用户名</label>
+          <input type="text" id="sUser" class="inp" placeholder="admin">
+        </div>
+        <div class="field">
+          <label>密码</label>
+          <input type="text" id="sPass" class="inp" placeholder="admin">
+          <div class="hint">用于登录/内嵌控制台。修改后自动重启核心生效</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>协议开关</h2>
+        <label class="chk"><input type="checkbox" id="sTcp"> TCP over TLS</label>
+        <label class="chk"><input type="checkbox" id="sQuic"> QUIC</label>
+        <label class="chk"><input type="checkbox" id="sWss"> WSS</label>
+        <div class="hint">三者共用「组网服务端口」；WSS 与 TCP 同端口时自动复用 TLS</div>
+      </div>
+
+      <div class="panel">
+        <h2>端口</h2>
+        <div class="field">
+          <label>管理页端口</label>
+          <input type="number" id="pPanel" class="inp">
+        </div>
+        <div class="field">
+          <label>组网服务端口（TCP+UDP）</label>
+          <input type="number" id="pService" class="inp">
+        </div>
+        <div class="field">
+          <label>控制台内部端口（仅回环）</label>
+          <input type="number" id="pConsole" class="inp">
+        </div>
+        <div class="row">
+          <button class="btn" id="btnSavePorts">保存端口</button>
+          <span class="muted">改动管理页端口后需重新访问新端口</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>服务端互联（可选）</h2>
+        <label class="chk"><input type="checkbox" id="sPeerOn"> 启用服务端互联</label>
+        <div class="field">
+          <label>互联监听端口（UDP）</label>
+          <input type="number" id="sPeerPort" class="inp" placeholder="29873">
+        </div>
+        <div class="field">
+          <label>其它服务端地址（每行一个）</label>
+          <textarea id="sPeers" class="inp mono" rows="3" placeholder="server1.example.com:29873"></textarea>
+        </div>
+        <div class="field">
+          <label>互联验证码</label>
+          <input type="text" id="sPeerToken" class="inp" placeholder="多台服务端需一致">
+        </div>
+      </div>
+
+      <div class="sticky-actions">
+        <button class="btn primary" id="btnSaveSettings">保存设置</button>
+        <span class="muted" id="settingsMsg"></span>
+      </div>
+    </section>
+
+    <!-- 配置导入导出 -->
+    <section class="tab hidden" id="tab-backup">
+      <h1>配置导入导出</h1>
+      <div class="panel">
+        <h2>导出服务器配置</h2>
+        <p class="muted">打包 <b>config.toml、settings.json、数据库（网络/设备记录）与证书</b>。
+          <b>不含日志</b>与核心二进制。用于迁移到新机器或备份。</p>
+        <div class="codepath" id="exportList"></div>
+        <button class="btn primary" id="btnExport">导出为 zip</button>
+      </div>
+
+      <div class="panel">
+        <h2>导入服务器配置</h2>
+        <p class="muted">选择之前导出的 zip。导入前会自动备份现有配置，失败自动回滚。
+          导入后核心会自动重启。</p>
+        <div class="row">
+          <input type="file" id="importFile" accept=".zip">
+          <button class="btn" id="btnImport">导入</button>
+        </div>
+        <div class="hint" id="importResult"></div>
+      </div>
+
+      <div class="panel">
+        <h2>日志目录</h2>
+        <p class="muted">日志与配置分开存放。<b>迁移时只需拷走配置目录，日志无需保留</b>。</p>
+        <div class="field">
+          <label>日志目录</label>
+          <input type="text" id="logDir" class="inp mono" placeholder="/data/log（默认）">
+          <div class="hint" id="logDirHint"></div>
+        </div>
+        <button class="btn" id="btnSaveLogDir">保存日志目录</button>
+      </div>
+    </section>
+
+    <!-- 控制台 -->
+    <section class="tab hidden" id="tab-console">
+      <h1>控制台
+        <span class="h-actions">
+          <button class="btn tiny" id="btnReloadFrame">重新加载</button>
+          <a class="btn tiny" href="console/" target="_blank" rel="noopener">新窗口打开</a>
+        </span>
+      </h1>
+      <div class="panel console-panel">
+        <div class="console-bar">
+          <span id="consoleDot" class="dot off"></span>
+          <span id="consoleBar">正在检测控制台…</span>
+          <button class="btn tiny hidden" id="btnConsoleStart" style="margin-left:auto">启动核心</button>
+        </div>
+        <div class="console-diag hidden" id="consoleDiag">
+          <div id="consoleDiagMsg"></div>
+          <pre id="consoleDiagLog"></pre>
+        </div>
+        <iframe id="consoleFrame" title="vnts 控制台"></iframe>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="tab hidden" id="tab-logs">
+      <h1>日志</h1>
+      <div class="panel">
+        <div class="row">
+          <select id="logSelect" class="inp short">
+            <option value="vnts2.log">vnts2.log（核心）</option>
+            <option value="shell.log">shell.log（后端）</option>
+            <option value="main.log">main.log</option>
+            <option value="update.log">update.log（更新）</option>
+          </select>
+          <button class="btn" id="btnReloadLog">刷新</button>
+          <button class="btn" id="btnClearLog">清空</button>
+          <span class="muted" id="logDirShown"></span>
+        </div>
+        <pre class="logview" id="logView">（空）</pre>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

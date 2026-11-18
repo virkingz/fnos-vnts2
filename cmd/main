@@ -1,0 +1,136 @@
+#!/bin/bash
+# vnts-nas 生命周期主脚本：处理 start / stop / status
+# 本脚本托管「管理页后端」(shell_main)，由后端负责拉起并守护 vnts2 核心。
+
+set -u
+
+: "${TRIM_APPDEST:=/var/apps/vnts-nas/target}"
+: "${TRIM_PKGVAR:=/var/apps/vnts-nas/var}"
+: "${TRIM_PKGETC:=/var/apps/vnts-nas/etc}"
+: "${TRIM_PKGTMP:=/var/apps/vnts-nas/tmp}"
+: "${TRIM_TEMP_LOGFILE:=${TRIM_PKGTMP}/error.log}"
+: "${TRIM_APPNAME:=vnts-nas}"
+
+LIB="${TRIM_APPDEST}/shell/lib.sh"
+if [ -f "$LIB" ]; then
+    # shellcheck disable=SC1090
+    . "$LIB"
+else
+    echo "缺少组件: ${LIB}" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    exit 1
+fi
+
+vnt_paths
+vnt_ensure_dirs
+vnt_load_ports
+if [ ! -f "$(vnt_port_file)" ]; then
+    vnt_save_ports
+fi
+
+PYTHON_BIN="$(vnt_shell_python)"
+SHELL_PY="${TRIM_APPDEST}/shell/shell_main.py"
+SHELL_PID="$(vnt_shell_pid)"
+SHELL_LOG="$(vnt_shell_log)"
+
+start_shell() {
+    if vnt_shell_running; then
+        vnt_log "shell already running"
+        return 0
+    fi
+    if [ ! -f "$SHELL_PY" ]; then
+        vnt_fail "缺少管理页后端: $SHELL_PY"
+    fi
+    if [ ! -x "$(vnt_core_bin)" ]; then
+        vnt_log "core binary missing; 管理页仍可启动，用于下载核心"
+    fi
+
+    if vnt_port_in_use "$PANEL_PORT"; then
+        vnt_log "port ${PANEL_PORT} in use, cleaning before start"
+        vnt_kill_by_port "$PANEL_PORT"
+        sleep 1
+    fi
+
+    vnt_log "starting shell backend: $PYTHON_BIN $SHELL_PY"
+    cd "${TRIM_APPDEST}/shell" || vnt_fail "无法进入 shell 目录"
+    VNT_APPDEST="$TRIM_APPDEST" \
+    VNT_PKGVAR="$TRIM_PKGVAR" \
+    VNT_PKGETC="$TRIM_PKGETC" \
+    VNT_PKGTMP="$TRIM_PKGTMP" \
+    VNT_APPNAME="$TRIM_APPNAME" \
+    ${LOG_DIR:+LOG_DIR="$LOG_DIR"} \
+    nohup "$PYTHON_BIN" "$SHELL_PY" >> "$SHELL_LOG" 2>&1 &
+    local pid=$!
+    printf '%s' "$pid" > "$SHELL_PID"
+
+    local i=0
+    while [ $i -lt 20 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$SHELL_PID"
+            vnt_fail "管理页后端启动失败，请查看日志: $SHELL_LOG"
+        fi
+        if vnt_shell_port_up; then
+            vnt_log "shell backend up (pid=${pid})"
+            return 0
+        fi
+        sleep 1; i=$((i + 1))
+    done
+    vnt_log "shell backend pid alive but port not ready in 20s (continuing)"
+    return 0
+}
+
+stop_shell() {
+    local port="${PANEL_PORT:-$PANEL_PORT_DEFAULT}" pid i j
+
+    if vnt_shell_running; then
+        pid="$(head -n 1 "$SHELL_PID" | tr -d '[:space:]')"
+        vnt_log "stopping shell backend pid=${pid}"
+        kill -TERM "$pid" 2>/dev/null || true
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ $i -lt 15 ]; do
+            sleep 1; i=$((i + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    rm -f "$SHELL_PID"
+
+    j=0
+    while [ $j -lt 5 ]; do
+        vnt_shell_port_up || break
+        vnt_log "port ${port} still listening, terminating its owner"
+        vnt_kill_by_port "$port"
+        sleep 1
+        j=$((j + 1))
+    done
+
+    if vnt_shell_port_up; then
+        vnt_log "WARN: port ${port} still occupied after stop attempts"
+        return 0
+    fi
+    vnt_log "shell backend stopped, port ${port} released"
+    return 0
+}
+
+case "${1:-}" in
+start)
+    start_shell || exit 1
+    exit 0
+    ;;
+stop)
+    stop_shell || exit 1
+    vnt_stop_core || true
+    exit 0
+    ;;
+status)
+    if vnt_shell_running; then
+        exit 0
+    fi
+    rm -f "$SHELL_PID"
+    exit 3
+    ;;
+*)
+    exit 1
+    ;;
+esac

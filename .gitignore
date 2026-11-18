@@ -1,0 +1,24 @@
+# 构建产物（fpk 只作 Release 附件，不入代码库）
+*.fpk
+build/
+
+__pycache__/
+*.pyc
+*.pyo
+
+.DS_Store
+Thumbs.db
+
+*.bak
+*.new
+*.download
+
+/testvar/
+/_t/
+
+# 图标生成物（由 scripts/gen_icons.py 生成，pack.sh 打包前会自动重建）
+app/ui/images/icon_*.png
+app/shell/web/icon.png
+
+# 临时目录（本地排查用）
+.ci/

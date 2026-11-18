@@ -1,0 +1,37 @@
+[
+    {
+        "stepTitle": "端口设置",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "本应用是 VNT <b>服务端</b>（vnts2）的管理壳。<br>两个端口各有用途，都有默认值，通常无需修改。<br>安装后打开「VNT 服务端」，其中的<b>服务端设置</b>可以继续配置网段、白名单、管理员账号等；网络的创建与设备管理在<b>控制台</b>中完成。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_web_port",
+                "label": "管理页端口",
+                "initValue": "19098",
+                "rules": [
+                    { "required": true, "message": "请填写端口" },
+                    { "pattern": "^[0-9]+$", "message": "端口只能是数字" },
+                    { "min": 1, "max": 65535, "message": "端口范围 1-65535" }
+                ]
+            },
+            {
+                "type": "text",
+                "field": "wizard_service_port",
+                "label": "组网服务端口",
+                "initValue": "29872",
+                "rules": [
+                    { "required": true, "message": "请填写端口" },
+                    { "pattern": "^[0-9]+$", "message": "端口只能是数字" },
+                    { "min": 1, "max": 65535, "message": "端口范围 1-65535" }
+                ]
+            },
+            {
+                "type": "tips",
+                "helpText": "<b>管理页端口</b>：打开「VNT 服务端」时访问的端口。<br><b>组网服务端口</b>：客户端连接本服务端所用的端口（TCP 与 UDP 同号）。<br>若与其他应用冲突，改成别的端口即可；改完记得在路由器/防火墙放行新端口。"
+            }
+        ]
+    }
+]

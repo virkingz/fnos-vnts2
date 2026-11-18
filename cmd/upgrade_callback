@@ -1,0 +1,44 @@
+#!/bin/bash
+# 升级后：补齐权限，保留用户数据与已下载核心。端口/配置不重置。
+set -u
+
+: "${TRIM_APPDEST:=/var/apps/vnts-nas/target}"
+: "${TRIM_PKGVAR:=/var/apps/vnts-nas/var}"
+: "${TRIM_PKGETC:=/var/apps/vnts-nas/etc}"
+: "${TRIM_PKGTMP:=/var/apps/vnts-nas/tmp}"
+: "${TRIM_TEMP_LOGFILE:=${TRIM_PKGTMP}/error.log}"
+: "${TRIM_APPNAME:=vnts-nas}"
+
+LIB="${TRIM_APPDEST}/shell/lib.sh"
+[ -f "$LIB" ] || exit 0
+# shellcheck disable=SC1090
+. "$LIB"
+
+vnt_paths
+vnt_ensure_dirs
+chmod +x "${TRIM_APPDEST}"/cmd/* 2>/dev/null || true
+chmod 755 "${TRIM_APPDEST}/shell/lib.sh" 2>/dev/null || true
+[ -f "$(vnt_core_bin)" ] && chmod 755 "$(vnt_core_bin)" 2>/dev/null || true
+
+if [ ! -f "$(vnt_port_file)" ]; then
+    PANEL_PORT="${PANEL_PORT_DEFAULT}"
+    SERVICE_PORT="${SERVICE_PORT_DEFAULT}"
+    CONSOLE_PORT="${CONSOLE_PORT_DEFAULT}"
+    vnt_save_ports
+fi
+
+# 升级后重渲染配置（新版本壳可能新增字段），并保留用户已有设置
+vnt_render_server_config && vnt_log "upgrade_callback: 配置已刷新" || true
+
+# 核心缺失则重新拉取
+if [ ! -x "$(vnt_core_bin)" ]; then
+    ver="$(vnt_latest_version || true)"
+    if [ -n "$ver" ]; then
+        vnt_install_core "$ver" || vnt_log "WARN: upgrade 后核心缺失且下载失败"
+    else
+        vnt_log "WARN: upgrade 后核心缺失，且无法查询最新版本"
+    fi
+fi
+
+vnt_log "upgrade_callback done (old=${TRIM_OLD_APPVER:-?})"
+exit 0

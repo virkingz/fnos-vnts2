@@ -1,0 +1,14 @@
+{
+    ".url": {
+        "vnts-nas.main": {
+            "title": "VNT 服务端",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/vnts-nas",
+            "gatewaySocket": "app.sock",
+            "url": "/app/vnts-nas",
+            "allUsers": false
+        }
+    }
+}

@@ -1,0 +1,60 @@
+#!/bin/bash
+# 配置变更后：仅应用端口。其余设置在管理页「服务端设置」中调整。
+set -u
+
+: "${TRIM_APPDEST:=/var/apps/vnts-nas/target}"
+: "${TRIM_PKGVAR:=/var/apps/vnts-nas/var}"
+: "${TRIM_PKGETC:=/var/apps/vnts-nas/etc}"
+: "${TRIM_PKGTMP:=/var/apps/vnts-nas/tmp}"
+: "${TRIM_TEMP_LOGFILE:=${TRIM_PKGTMP}/error.log}"
+: "${TRIM_APPNAME:=vnts-nas}"
+
+LIB="${TRIM_APPDEST}/shell/lib.sh"
+[ -f "$LIB" ] || exit 0
+# shellcheck disable=SC1090
+. "$LIB"
+
+vnt_paths
+vnt_ensure_dirs
+vnt_load_ports
+
+CHANGED=0
+
+vnt_port_ok() {
+    case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+if [ -n "${wizard_web_port:-}" ]; then
+    if ! vnt_port_ok "${wizard_web_port}"; then
+        vnt_log "config_callback: 忽略非法的管理页端口 ${wizard_web_port}"
+    elif [ "${wizard_web_port}" != "${PANEL_PORT}" ]; then
+        PANEL_PORT="${wizard_web_port}"; CHANGED=1
+    fi
+fi
+
+if [ -n "${wizard_service_port:-}" ]; then
+    if ! vnt_port_ok "${wizard_service_port}"; then
+        vnt_log "config_callback: 忽略非法的组网服务端口 ${wizard_service_port}"
+    elif [ "${wizard_service_port}" != "${SERVICE_PORT}" ]; then
+        SERVICE_PORT="${wizard_service_port}"; CHANGED=1
+    fi
+fi
+
+if [ "${PANEL_PORT}" = "${SERVICE_PORT}" ]; then
+    vnt_log "config_callback: 两端口冲突，组网服务端口回退默认"
+    SERVICE_PORT="${SERVICE_PORT_DEFAULT}"; CHANGED=1
+fi
+
+vnt_save_ports
+# 端口变了要重渲染 config.toml（组网服务端口写入 tcp/quic/ws bind）
+[ "$CHANGED" = "1" ] && vnt_render_server_config
+
+if [ "$CHANGED" = "1" ]; then
+    vnt_log "config_callback: port changed (panel=${PANEL_PORT}, service=${SERVICE_PORT})"
+else
+    vnt_log "config_callback: no port change"
+fi
+exit 0

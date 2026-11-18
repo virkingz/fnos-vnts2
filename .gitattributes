@@ -1,0 +1,28 @@
+# 统一换行符：仓库内一律使用 LF
+* text=auto eol=lf
+
+# 文本文件显式声明
+*.sh    text eol=lf
+*.py    text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# 无后缀的脚本与配置（飞牛规范）也要 LF
+manifest         text eol=lf
+cmd/*            text eol=lf
+config/*         text eol=lf
+wizard/*         text eol=lf
+app/ui/config    text eol=lf
+app/shell/lib.sh text eol=lf
+
+# 二进制文件不做任何转换
+*.fpk   binary
+*.png   binary
+*.PNG   binary
+*.tgz   binary
+*.gz    binary

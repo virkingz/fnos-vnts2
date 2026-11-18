@@ -1,0 +1,553 @@
+/* vnts-nas 管理页前端 */
+(function () {
+  'use strict';
+
+  var TOKEN = (window.__PANEL__ && window.__PANEL__.token) || '';
+  var $ = function (s) { return document.querySelector(s); };
+  var $$ = function (s) { return Array.prototype.slice.call(document.querySelectorAll(s)); };
+
+  // 挂载前缀：直连时为 ''，经飞牛网关内嵌时为 '/app/vnts-nas'。
+  // 绝对路径请求必须带上它，否则会打到飞牛根目录而不是本应用。
+  var PREFIX = (function () {
+    var p = location.pathname || '/';
+    var m = p.match(/^(\/app\/[^\/]+)\/?/);
+    return m ? m[1] : '';
+  })();
+
+  // ---------------- 全局忙碌锁 ----------------
+  // 核心操作（启动/停止/重启/下载/上传/导入/导出/保存）执行期间，
+  // 禁掉所有交互控件，避免并发点击造成重复启动、端口冲突等竞态问题。
+  var busyDepth = 0;
+
+  function setBusy(on) {
+    busyDepth = Math.max(0, busyDepth + (on ? 1 : -1));
+    var locked = busyDepth > 0;
+    // 所有按钮与输入控件统一禁用（导航标签不禁，允许查看）
+    $$('.btn, .inp, input, select, textarea').forEach(function (el) {
+      if (el.id === 'consoleFrame') return;
+      if (el.tagName === 'A') return;            // 链接不禁（如"新窗口打开"）
+      if (locked) {
+        if (!el.dataset._wasDisabled) {
+          el.dataset._wasDisabled = el.disabled ? '1' : '0';
+        }
+        el.disabled = true;
+        el.classList.add('is-busy');
+      } else {
+        el.disabled = el.dataset._wasDisabled === '1';
+        delete el.dataset._wasDisabled;
+        el.classList.remove('is-busy');
+      }
+    });
+    document.body.classList.toggle('op-busy', locked);
+  }
+
+  // 包裹一次「占用锁 → 执行 → 释放锁」的操作。
+  // fn 返回 Promise 时，等其结束（含 finally）再释放。
+  function withBusy(fn) {
+    setBusy(true);
+    var done = function () { setBusy(false); };
+    try {
+      var r = fn();
+      if (r && typeof r.then === 'function') {
+        return r.then(function (v) { done(); return v; },
+                      function (e) { done(); throw e; });
+      }
+      done();
+      return r;
+    } catch (e) {
+      done();
+      throw e;
+    }
+  }
+
+  // ---------------- API ----------------
+  function api(path, opts) {
+    opts = opts || {};
+    var headers = opts.headers || {};
+    if (TOKEN) headers['X-Panel-Token'] = TOKEN;
+    if (opts.json !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(opts.json);
+    }
+    return fetch(PREFIX + '/panel-api' + path, {
+      method: opts.method || (opts.body ? 'POST' : 'GET'),
+      headers: headers,
+      body: opts.body
+    }).then(function (r) {
+      return r.json().catch(function () { return { code: r.status, msg: 'HTTP ' + r.status }; });
+    }).then(function (j) {
+      if (j && j.code === 0) return j.data;
+      throw new Error((j && j.msg) || '请求失败');
+    });
+  }
+
+  // ---------------- toast ----------------
+  function toast(msg, kind) {
+    var el = document.createElement('div');
+    el.className = 'toast ' + (kind || '');
+    el.textContent = msg;
+    $('#toasts').appendChild(el);
+    setTimeout(function () { el.remove(); }, kind === 'err' ? 6000 : 3200);
+  }
+
+  // ---------------- tabs ----------------
+  function switchTab(name) {
+    $$('.nav-item').forEach(function (a) {
+      a.classList.toggle('active', a.getAttribute('data-tab') === name);
+    });
+    $$('.tab').forEach(function (s) {
+      s.classList.toggle('hidden', s.id !== 'tab-' + name);
+    });
+    location.hash = name;
+    if (name === 'logs') loadLog();
+    if (name === 'backup') refreshBackup();
+    if (name === 'console') consoleEnter();
+  }
+  $$('.nav-item').forEach(function (a) {
+    a.addEventListener('click', function () { switchTab(a.getAttribute('data-tab')); });
+  });
+
+  // ---------------- 总览 ----------------
+  function card(k, v, cls, small) {
+    return '<div class="card"><div class="k">' + k + '</div><div class="v ' + (cls || '') +
+      (small ? ' small' : '') + '">' + v + '</div></div>';
+  }
+
+  function renderOverview(st) {
+    var run = st.core_running
+      ? '<span class="v ok">运行中</span>'
+      : (st.core_present ? '<span class="v warn">已停止</span>' : '<span class="v err">未安装</span>');
+    var html = '';
+    html += '<div class="card"><div class="k">核心状态</div><div class="v">' + run + '</div></div>';
+    html += card('核心版本', st.core_version ? 'v' + st.core_version : '未下载', '', true);
+    html += card('组网服务端口', st.ports.SERVICE_PORT, '', true);
+    html += card('管理页端口', st.ports.PANEL_PORT, '', true);
+    html += card('默认网段', (st.settings && st.settings.network) || '-', '', true);
+    html += card('白名单', (st.settings && st.settings.white_list && st.settings.white_list.length)
+      ? st.settings.white_list.join(', ') : '全部允许', '', true);
+    html += card('日志目录', st.log_dir, '', true);
+    $('#ovCards').innerHTML = html;
+
+    var host = location.hostname || 'NAS-IP';
+    $('#ovAddr').textContent = host + ':' + st.ports.SERVICE_PORT;
+    $('#sideStatus').innerHTML = '<span class="dot ' + (st.core_running ? 'on' : 'off') + '"></span>' +
+      (st.core_running ? '核心运行中' : (st.core_present ? '核心已停止' : '核心未安装'));
+  }
+
+  function loadState() {
+    return api('/state').then(function (st) {
+      renderOverview(st);
+      $('#coreCur').textContent = st.core_version ? 'v' + st.core_version : '未下载';
+      $('#coreRun').textContent = st.core_running ? ('运行中 (pid ' + st.core_pid + ')') : '未运行';
+      $('#coreArch').textContent = st.arch + (st.arch_supported ? '' : '（无官方包）');
+      return st;
+    });
+  }
+
+  // ---------------- 核心 ----------------
+  function coreProg(on, text) {
+    var p = $('#coreProg');
+    p.classList.toggle('hidden', !on);
+    if (on) {
+      p.querySelector('span').textContent = text || '下载中…';
+      p.querySelector('i').className = 'indet';
+    }
+  }
+
+  $('#btnCheck').addEventListener('click', function () {
+    withBusy(function () {
+      $('#coreLatest').textContent = '查询中…';
+      return api('/core/check').then(function (d) {
+        $('#coreLatest').textContent = 'v' + d.latest;
+        var act = d.state === 'latest' ? '已是最新' : (d.state === 'update' ? '可更新' : '尚未安装');
+        $('#btnDownload').textContent = d.state === 'update' ? ('更新到 v' + d.latest) : '下载核心';
+        $('#btnDownload').dataset.version = d.latest;
+        toast('最新版本 v' + d.latest + '（' + act + '）', 'ok');
+      }).catch(function (e) {
+        $('#coreLatest').textContent = '查询失败';
+        toast(e.message, 'err');
+      });
+    });
+  });
+
+  $('#btnDownload').addEventListener('click', function () {
+    withBusy(function () {
+      var ver = $('#btnDownload').dataset.version || '';
+      coreProg(true);
+      return api('/core/download', { json: { version: ver } }).then(function (d) {
+        toast('核心已安装 v' + (d.version || ver), 'ok');
+        return loadState();
+      }).catch(function (e) { toast(e.message, 'err'); })
+        .finally(function () { coreProg(false); });
+    });
+  });
+
+  $('#btnStart').addEventListener('click', function () {
+    withBusy(function () {
+      return api('/core/start', { method: 'POST' }).then(function (d) {
+        toast('已启动：' + d.msg, 'ok'); return loadState();
+      }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  });
+  $('#btnStop').addEventListener('click', function () {
+    withBusy(function () {
+      return api('/core/stop', { method: 'POST' }).then(function () {
+        toast('核心已停止', 'ok'); return loadState();
+      }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  });
+
+  $('#btnUpload').addEventListener('click', function () {
+    var f = $('#coreFile').files[0];
+    if (!f) return toast('请选择文件', 'warn');
+    var ver = $('#coreVer').value.trim();
+    withBusy(function () {
+      coreProg(true, '上传中…');
+      var headers = {};
+      if (TOKEN) headers['X-Panel-Token'] = TOKEN;
+      if (ver) headers['X-Core-Version'] = ver;
+      return fetch(PREFIX + '/panel-api/core/upload', { method: 'POST', headers: headers, body: f })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j.code !== 0) throw new Error(j.msg);
+          toast('上传安装成功 v' + (j.data.version || ver || '?'), 'ok');
+          return loadState();
+        })
+        .catch(function (e) { toast('上传失败：' + e.message, 'err'); })
+        .finally(function () { coreProg(false); });
+    });
+  });
+
+  $('#btnSaveNet').addEventListener('click', function () {
+    withBusy(function () {
+      return Promise.all([
+        api('/mirror', { method: 'PUT', json: { mirror: $('#mirror').value } }),
+        api('/proxy', { method: 'PUT', json: { proxy: $('#proxy').value } })
+      ]).then(function () { toast('已保存下载源与代理', 'ok'); })
+        .catch(function (e) { toast(e.message, 'err'); });
+    });
+  });
+  $('#btnTest').addEventListener('click', function () {
+    withBusy(function () {
+      $('#testResult').textContent = '测试中…';
+      return api('/test-connection').then(function (d) {
+        $('#testResult').textContent = '成功，耗时 ' + d.ms + ' ms';
+        toast('连通性正常', 'ok');
+      }).catch(function (e) {
+        $('#testResult').textContent = '失败';
+        toast(e.message, 'err');
+      });
+    });
+  });
+
+  // ---------------- 设置 ----------------
+  function fillSettings(s) {
+    $('#sNetwork').value = s.network || '';
+    $('#sWhite').value = (s.white_list || []).join(',');
+    $('#sLease').value = s.lease_duration || 86400;
+    $('#sCustom').value = Object.keys(s.custom_nets || {}).map(function (k) {
+      return k + '=' + s.custom_nets[k];
+    }).join('\n');
+    $('#sPersist').checked = !!s.persistence;
+    $('#sUser').value = s.username || '';
+    $('#sPass').value = s.password || '';
+    $('#sTcp').checked = !!s.enable_tcp;
+    $('#sQuic').checked = !!s.enable_quic;
+    $('#sWss').checked = !!s.enable_wss;
+    $('#sPeerOn').checked = !!s.enable_peer;
+    $('#sPeerPort').value = s.peer_bind_port || 29873;
+    $('#sPeers').value = (s.peer_servers || []).join('\n');
+    $('#sPeerToken').value = s.server_token || '';
+  }
+
+  function collectSettings() {
+    var custom = {};
+    $('#sCustom').value.split('\n').forEach(function (ln) {
+      ln = ln.trim();
+      if (!ln) return;
+      var i = ln.indexOf('=');
+      if (i > 0) custom[ln.slice(0, i).trim()] = ln.slice(i + 1).trim();
+    });
+    return {
+      network: $('#sNetwork').value.trim(),
+      white_list: $('#sWhite').value.split(/[,\s]+/).filter(Boolean),
+      lease_duration: parseInt($('#sLease').value, 10) || 86400,
+      custom_nets: custom,
+      persistence: $('#sPersist').checked,
+      username: $('#sUser').value.trim(),
+      password: $('#sPass').value,
+      enable_tcp: $('#sTcp').checked,
+      enable_quic: $('#sQuic').checked,
+      enable_wss: $('#sWss').checked,
+      enable_peer: $('#sPeerOn').checked,
+      peer_bind_port: parseInt($('#sPeerPort').value, 10) || 29873,
+      peer_servers: $('#sPeers').value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean),
+      server_token: $('#sPeerToken').value.trim()
+    };
+  }
+
+  $('#btnSaveSettings').addEventListener('click', function () {
+    var msg = $('#settingsMsg');
+    withBusy(function () {
+      msg.textContent = '保存中…';
+      return api('/settings', { method: 'PUT', json: collectSettings() }).then(function (d) {
+        msg.textContent = '已保存' + (d.restarted ? '，核心已重启' : '');
+        toast('设置已保存', 'ok'); return loadState();
+      }).catch(function (e) {
+        msg.textContent = '';
+        toast(e.message, 'err');
+      });
+    });
+  });
+
+  function loadPorts() {
+    api('/ports').then(function (p) {
+      $('#pPanel').value = p.PANEL_PORT;
+      $('#pService').value = p.SERVICE_PORT;
+      $('#pConsole').value = p.CONSOLE_PORT;
+    });
+  }
+  $('#btnSavePorts').addEventListener('click', function () {
+    withBusy(function () {
+      return api('/ports', { method: 'PUT', json: {
+        PANEL_PORT: $('#pPanel').value,
+        SERVICE_PORT: $('#pService').value,
+        CONSOLE_PORT: $('#pConsole').value
+      } }).then(function (d) {
+        toast(d.restart_needed ? '端口已保存，请改用新端口访问管理页' : '端口已保存', 'ok');
+        return loadState();
+      }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  });
+
+  // ---------------- 导入导出 ----------------
+  function refreshBackup() {
+    api('/logdir').then(function (d) {
+      $('#logDir').value = d.from_env ? d.log_dir : (d.log_dir === d.default ? '' : d.log_dir);
+      $('#logDir').placeholder = d.default + '（默认）';
+      $('#logDirHint').textContent = d.from_env
+        ? '当前由环境变量 LOG_DIR 指定：' + d.log_dir + '（界面不可改）'
+        : '留空则用默认：' + d.default;
+    });
+    api('/state').then(function (st) {
+      var items = ['server/config.toml', 'server/settings.json',
+        st.has_db ? 'server/network_control.db' : null, 'server/cert.pem / key.pem（若存在）']
+        .filter(Boolean);
+      $('#exportList').innerHTML = items.map(function (x) { return '✓ ' + x; }).join('<br>') +
+        '<br><span style="color:#dc2626">✗ 不含日志目录（' + st.log_dir + '）</span>';
+    });
+  }
+
+  $('#btnExport').addEventListener('click', function () {
+    withBusy(function () {
+      var a = document.createElement('a');
+      a.href = PREFIX + '/panel-api/config/export';
+      a.download = '';
+      document.body.appendChild(a); a.click(); a.remove();
+      toast('已开始导出', 'ok');
+    });
+  });
+
+  $('#btnImport').addEventListener('click', function () {
+    var f = $('#importFile').files[0];
+    if (!f) return toast('请选择 zip 文件', 'warn');
+    if (!confirm('导入将覆盖当前服务端配置与数据库（会自动备份）。继续？')) return;
+    withBusy(function () {
+      $('#importResult').textContent = '导入中…';
+      var headers = {};
+      if (TOKEN) headers['X-Panel-Token'] = TOKEN;
+      return fetch(PREFIX + '/panel-api/config/import', { method: 'POST', headers: headers, body: f })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j.code !== 0) throw new Error(j.msg);
+          $('#importResult').textContent = '已导入：' + (j.data.restored || []).join('、');
+          toast('导入成功', 'ok');
+          loadState(); loadPorts();
+          api('/settings').then(fillSettings);
+        })
+        .catch(function (e) {
+          $('#importResult').textContent = '';
+          toast('导入失败：' + e.message, 'err');
+        });
+    });
+  });
+
+  $('#btnSaveLogDir').addEventListener('click', function () {
+    withBusy(function () {
+      return api('/logdir', { method: 'PUT', json: { log_dir: $('#logDir').value.trim() } })
+        .then(function (d) { toast('日志目录已设为 ' + d.log_dir, 'ok'); refreshBackup(); loadState(); })
+        .catch(function (e) { toast(e.message, 'err'); });
+    });
+  });
+
+  // ---------------- 日志 ----------------
+  function loadLog() {
+    var name = $('#logSelect').value;
+    api('/logs?name=' + encodeURIComponent(name)).then(function (d) {
+      $('#logView').textContent = d.text || '（空）';
+      var parts = Object.keys(d.sizes || {}).map(function (k) {
+        return k + ':' + (d.sizes[k] / 1024).toFixed(1) + 'K';
+      });
+      $('#logDirShown').textContent = parts.join('  ');
+      $('#logView').scrollTop = $('#logView').scrollHeight;
+    }).catch(function (e) { $('#logView').textContent = '读取失败：' + e.message; });
+  }
+  $('#btnReloadLog').addEventListener('click', loadLog);
+  $('#logSelect').addEventListener('change', loadLog);
+  $('#btnClearLog').addEventListener('click', function () {
+    if (!confirm('清空所有日志文件？')) return;
+    withBusy(function () {
+      return api('/logs/clear', { method: 'POST' }).then(function () {
+        toast('日志已清空', 'ok'); loadLog();
+      }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  });
+
+  // ---------------- 控制台 ----------------
+  // 关键：iframe 的 src 一旦固定就不会因核心后来启动而刷新。
+  // 因此这里先探测控制台是否就绪，就绪才加载 iframe；
+  // 未就绪时展示诊断（含核心日志尾部）并轮询等待，就绪后自动加载。
+  var consoleState = { ready: false, timer: null, loaded: false, username: '' };
+
+  function consoleSetBar(kind, text) {
+    $('#consoleDot').className = 'dot ' + kind;
+    $('#consoleBar').textContent = text;
+  }
+
+  function consoleLoadFrame() {
+    if (consoleState.loaded) return;
+    consoleState.loaded = true;
+    // hash 显式指向网络管理：控制台此前若停在其他视图（如系统设置），
+    // 会因 hash 保留而直接进那一页。这里强制回到首页。
+    // 注意：控制台路由表本身已有 `{path:'/', redirect:'/networks'}`，
+    // 但若登录前停在 #/login，登录后由守卫跳转，个别时序下 URL 可能停在 #/。
+    // 故加载后再做一次同源兜底纠正（见 nudgeConsoleHash）。
+    $('#consoleFrame').src = PREFIX + '/console/?' + Date.now() + '#/networks';
+    $('#consoleFrame').onload = function () {
+      nudgeConsoleHash(6);
+    };
+    $('#consoleFrame').classList.remove('hidden');
+    $('#consoleDiag').classList.add('hidden');
+    $('#btnConsoleStart').classList.add('hidden');
+    var u = consoleState.username || 'admin';
+    consoleSetBar('on', '控制台已加载（登录账号：' + u + '）');
+  }
+
+  // 同源兜底：管理页与控制台都在同一源下，可直接读 iframe 的 location。
+  // 若 hash 为空、'#/' 或 '#/login'（已登录时），纠正到 '#/networks'。
+  // 只在必要时改，且限定重试次数，避免与前端路由互相打架。
+  function nudgeConsoleHash(tries) {
+    var fr = $('#consoleFrame');
+    var want = '#/networks';
+    try {
+      var loc = fr.contentWindow && fr.contentWindow.location;
+      if (!loc) return;
+      var h = loc.hash || '';
+      // 非登录页却停在根路径 → 纠正
+      if (h === '' || h === '#' || h === '#/') {
+        loc.replace(loc.pathname + loc.search + want);
+        return;
+      }
+    } catch (e) {
+      return;  // 非同源（理论上不会），静默放弃
+    }
+    if (tries > 1) {
+      setTimeout(function () { nudgeConsoleHash(tries - 1); }, 1200);
+    }
+  }
+
+  function consoleShowDiag(d) {
+    $('#consoleFrame').classList.add('hidden');
+    $('#consoleDiag').classList.remove('hidden');
+    $('#btnConsoleStart').classList.toggle('hidden', !d.core_present);
+
+    if (!d.core_present) {
+      consoleSetBar('off', '核心尚未下载');
+      $('#consoleDiagMsg').innerHTML =
+        '还未下载 vnts2 核心，控制台无法使用。<br>请到「<b>核心更新</b>」标签点「检查更新」→「下载核心」。';
+      return;
+    }
+    if (!d.core_running) {
+      consoleSetBar('wait', '核心未运行');
+      $('#consoleDiagMsg').innerHTML =
+        '核心已下载但未运行，控制台无法连接。<br>点右上「<b>启动核心</b>」，或到「核心更新」标签启动。';
+      return;
+    }
+    if (d.ready) return;
+    consoleSetBar('wait', '核心运行中，控制台正在就绪…');
+    $('#consoleDiagMsg').innerHTML =
+      '核心进程在运行，但控制台端口（' + d.bind + '）尚未响应。<br>' +
+      '刚启动时属正常现象，通常几秒内可用；若持续如此请看下方核心日志。';
+  }
+
+  function consolePoll() {
+    clearTimeout(consoleState.timer);
+    api('/console-ready').then(function (d) {
+      if (d.username) consoleState.username = d.username;
+      if (d.ready) {
+        consoleLoadFrame();
+        return;
+      }
+      consoleShowDiag(d);
+      $('#consoleDiagLog').textContent = d.log_tail || '（核心日志为空）';
+      // 未就绪则继续等待，就绪后自动加载
+      consoleState.timer = setTimeout(consolePoll, 2500);
+    }).catch(function (e) {
+      consoleSetBar('off', '检测失败：' + e.message);
+      consoleState.timer = setTimeout(consolePoll, 4000);
+    });
+  }
+
+  function consoleEnter() {
+    if (consoleState.ready) return;
+    consolePoll();
+  }
+
+  $('#btnReloadFrame').addEventListener('click', function () {
+    withBusy(function () {
+      consoleState.loaded = false;
+      $('#consoleFrame').src = 'about:blank';
+      consoleState.ready = false;
+      consolePoll();
+    });
+  });
+
+  $('#btnConsoleStart').addEventListener('click', function () {
+    withBusy(function () {
+      consoleSetBar('wait', '正在启动核心…');
+      return api('/core/start', { method: 'POST' }).then(function () {
+        toast('核心已启动', 'ok');
+        consoleState.ready = false;
+        consolePoll();
+        loadState();
+      }).catch(function (e) {
+        toast('启动失败：' + e.message, 'err');
+        consolePoll();
+      });
+    });
+  });
+
+  // ---------------- 复制地址 ----------------
+  $('#copyAddr').addEventListener('click', function () {
+    var t = $('#ovAddr').textContent;
+    navigator.clipboard.writeText(t).then(function () { toast('已复制 ' + t, 'ok'); },
+      function () { toast('复制失败，请手动选择', 'warn'); });
+  });
+
+  // ---------------- 初始化 ----------------
+  function boot() {
+    var hash = (location.hash || '#overview').slice(1) || 'overview';
+    switchTab(hash);
+    loadState().catch(function (e) { toast('加载状态失败：' + e.message, 'err'); });
+    loadPorts();
+    api('/settings').then(fillSettings).catch(function () {});
+    api('/mirror').catch(function () {});
+    // 拉取镜像/代理现值
+    api('/state').then(function (st) {
+      $('#mirror').value = st.mirror || '';
+      $('#proxy').value = st.proxy || '';
+    });
+    setInterval(function () { loadState().catch(function () {}); }, 8000);
+  }
+  boot();
+})();

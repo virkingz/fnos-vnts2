@@ -1,0 +1,8 @@
+{
+    "defaults":
+    {
+        "run-as": "root"
+    },
+    "username": "vnts-nas",
+    "groupname": "vnts-nas"
+}
