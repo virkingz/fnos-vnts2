@@ -5,7 +5,9 @@
 const { execFileSync } = require('child_process');
 const path = require('path');
 
-const ORIGIN = 'http://127.0.0.1:8080';
+// 站点地址只在本地测试时用，用环境变量传入，不写死任何真实域名：
+//   PROBE_ORIGIN=https://your-host.example.com node scripts/probe_vite_url.js
+const ORIGIN = process.env.PROBE_ORIGIN || 'http://127.0.0.1:8080';
 
 // 兼容 python / python3（Linux 常见只有 python3）
 function pythonCmd() {

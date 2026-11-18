@@ -174,8 +174,8 @@ def main():
     res = S.download_core("2.0.9")
     check("前两次失败后仍安装成功", res.get("ok") is True, res)
     check("共尝试 3 次", len(tries) == 3, len(tries))
-    check("第 1 次走配置（镜像+代理）", tries[0][1] is None and "cfproxy" in tries[0][0], tries[0])
-    check("第 2 次走镜像直连", tries[1][1] == "" and "cfproxy" in tries[1][0], tries[1])
+    check("第 1 次走配置（镜像+代理）", tries[0][1] is None and "ghproxy" in tries[0][0], tries[0])
+    check("第 2 次走镜像直连", tries[1][1] == "" and "ghproxy" in tries[1][0], tries[1])
     check("第 3 次退回 GitHub 直连",
           tries[2][1] == "" and tries[2][0].startswith("https://github.com/"), tries[2])
     check("核心版本已记录", S.installed_version() == "2.0.9", S.installed_version())
