@@ -67,12 +67,17 @@ class StubClient(object):
         return True, ""
 
     def del_peer(self, a):
+        """删除地址。
+
+        真实核心的 DELETE 是「按字符串删 SQLite」，删一个本就不存在的地址
+        也会返回成功（HTTP 层不看 rows_affected）。这里照实还原：
+        只有 fail_del 才失败，与地址是否存在无关。
+        """
         self.calls.append(("del", a))
         if self.fail_del:
             return False, "删除失败"
-        if a not in self.addrs:
-            return False, "不存在"
-        self.addrs.remove(a)
+        if a in self.addrs:
+            self.addrs.remove(a)
         return True, ""
 
 
@@ -93,11 +98,31 @@ def gai_map(mapping):
     return _gai
 
 
-def rec(host="p.example.com", port=29873, cur="", prev=""):
-    return D.new_record(host, port) if not cur and not prev else {
-        "host": host, "port": port, "current": cur, "previous": prev,
-        "last_sync": 0, "last_ok": 0, "last_error": "",
-    }
+def rec(host="p.example.com", port=29873, cur="", prev="", managed=None):
+    """构造一条记录。
+
+    managed 表示「该地址此前是否已向核心登记过」（doc["managed"]）。
+    新版对账以 managed 为判定基准 —— 因为 GET /api/peer_servers 只返回
+    「当前连上的」地址，连不上的地址查不出来却真实存在于数据库中。
+    已登记过的地址不再重复 add。
+    """
+    r = D.new_record(host, port)
+    r["current"] = cur
+    r["previous"] = prev
+    r["_managed"] = managed
+    return r
+
+
+def doc_of(recs, managed=None):
+    """把记录列表包成文档，并汇总出 managed 集合。
+
+    未显式给出 managed 时，取每条记录的 current（模拟「这些地址都已登记」），
+    这符合正常演进到该状态的真实情况。
+    """
+    if managed is None:
+        managed = [r["current"] for r in recs if r.get("current")]
+    clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in recs]
+    return {"version": 1, "interval": 60, "records": clean, "managed": list(managed)}
 
 
 # ===========================================================================
@@ -187,7 +212,7 @@ check("新增域状态为空", by["b.com"]["current"] == "")
 # ===========================================================================
 print("\n[6] 同步：IP 变化 → 先加后删（最关键）")
 # ===========================================================================
-d = {"records": [rec(cur="9.9.9.9:29873")]}
+d = doc_of([rec(cur="9.9.9.9:29873")])
 c = StubClient(["9.9.9.9:29873"])
 acts = D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("调用顺序为先 add 后 del",
@@ -201,7 +226,7 @@ check("最终列表只剩新地址", c.addrs == ["1.2.3.4:29873"], c.addrs)
 # ===========================================================================
 print("\n[7] 同步：IP 未变 → 零写操作")
 # ===========================================================================
-d = {"records": [rec(cur="1.2.3.4:29873")]}
+d = doc_of([rec(cur="1.2.3.4:29873")])
 c = StubClient(["1.2.3.4:29873"])
 acts = D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("无 add/del 调用", c.calls == [], c.calls)
@@ -211,7 +236,7 @@ check("last_sync 被刷新", d["records"][0]["last_sync"] > 0)
 # ===========================================================================
 print("\n[8] 同步：解析失败 → 保留旧地址")
 # ===========================================================================
-d = {"records": [rec(cur="9.9.9.9:29873")]}
+d = doc_of([rec(cur="9.9.9.9:29873")])
 c = StubClient(["9.9.9.9:29873"])
 acts = D.sync_once(d, c, _getaddrinfo=gai_map({}))
 check("不做任何增删", c.calls == [], c.calls)
@@ -222,7 +247,7 @@ check("动作为 error", acts[0]["action"] == "error")
 # ===========================================================================
 print("\n[9] 同步：添加失败 → 绝不删旧")
 # ===========================================================================
-d = {"records": [rec(cur="9.9.9.9:29873")]}
+d = doc_of([rec(cur="9.9.9.9:29873")])
 c = StubClient(["9.9.9.9:29873"], fail_add=True)
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("尝试过 add", ("add", "1.2.3.4:29873") in c.calls, c.calls)
@@ -235,7 +260,7 @@ print("\n[10] 同步：以清单为准，清理一切多余地址")
 # ===========================================================================
 # 语义：dns-ip.json 是唯一真源。核心出站列表里凡不在清单中的地址都要清掉，
 # 包括在控制台手工添加的 —— 这是「先加后删中途重启留下多余记录」的收敛手段。
-d = {"records": [rec(cur="9.9.9.9:29873")]}
+d = doc_of([rec(cur="9.9.9.9:29873")])
 c = StubClient(["9.9.9.9:29873", "8.8.8.8:9999"])   # 后者是控制台手工加的
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("最终只剩清单要求的地址", c.addrs == ["1.2.3.4:29873"], c.addrs)
@@ -243,7 +268,7 @@ check("手工加的地址被清理", "8.8.8.8:9999" not in c.addrs)
 check("自己的旧地址被替换", "9.9.9.9:29873" not in c.addrs)
 
 # 场景：上一轮「已加新、未删旧」就重启核心 → 旧 IP 残留在列表里
-d = {"records": [rec(cur="1.2.3.4:29873")]}          # 记录里已是新 IP
+d = doc_of([rec(cur="1.2.3.4:29873")])          # 记录里已是新 IP
 c = StubClient(["1.2.3.4:29873", "9.9.9.9:29873"])   # 旧 IP 还赖着
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("残留的旧 IP 被清理（核心重启后的收敛）",
@@ -252,7 +277,7 @@ check("清理时不会重复 add 目标地址",
       [x for x in c.calls if x[0] == "add"] == [], c.calls)
 
 # 场景：清单里两条域名，核心里有第三条 → 只清第三条
-d = {"records": [rec("a.com", cur="1.1.1.1:1"), rec("b.com", cur="2.2.2.2:2")]}
+d = doc_of([rec("a.com", cur="1.1.1.1:1"), rec("b.com", cur="2.2.2.2:2")])
 d["records"][0]["port"] = 1
 d["records"][1]["port"] = 2
 c = StubClient(["1.1.1.1:1", "2.2.2.2:2", "7.7.7.7:7"])
@@ -261,12 +286,12 @@ check("只清理不在清单中的那条",
       sorted(c.addrs) == ["1.1.1.1:1", "2.2.2.2:2"], c.addrs)
 check("清理动作被记录",
       any(a["action"] == "del" and a["addr"] == "7.7.7.7:7" for a in
-          D.sync_once({"records": [rec("a.com", cur="1.1.1.1:1")]},
+          D.sync_once(doc_of([rec("a.com", cur="1.1.1.1:1")]),
                       StubClient(["1.1.1.1:1", "7.7.7.7:7"]),
                       _getaddrinfo=gai_map({"a.com": "1.1.1.1"}))))
 
 # 场景：域名解析失败时，其旧地址必须被保护，不能当残留清掉
-d = {"records": [rec(cur="9.9.9.9:29873")]}
+d = doc_of([rec(cur="9.9.9.9:29873")])
 c = StubClient(["9.9.9.9:29873", "7.7.7.7:7"])
 D.sync_once(d, c, _getaddrinfo=gai_map({}))          # 解析失败
 check("解析失败的旧地址受保护", "9.9.9.9:29873" in c.addrs, c.addrs)
@@ -277,7 +302,7 @@ print("\n[11] 同步：自愈（记录被手工删除后自动补回）")
 # ===========================================================================
 # 场景：IP 没变，但这条地址被人从控制台手工删掉了。
 # 判定以「核心实际列表」为准，因此应当自动补回。
-d = {"records": [rec(cur="1.2.3.4:29873")]}
+d = doc_of([rec(cur="1.2.3.4:29873")])
 c = StubClient([])                                   # 核心列表里已被清空
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("被删掉后自动补回", c.calls == [("add", "1.2.3.4:29873")], c.calls)
@@ -287,17 +312,18 @@ check("补回后不再有多余动作",
                   _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))[0]["action"] == "keep")
 
 # 场景：IP 变了且旧地址已被手工删除 → 只补新，不报删除失败
-d = {"records": [rec(cur="9.9.9.9:29873")]}
+d = doc_of([rec(cur="9.9.9.9:29873")])
 c = StubClient([])                                   # 旧地址也已被删
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
-check("旧地址已不在时只补新，不报删除失败",
-      c.calls == [("add", "1.2.3.4:29873")], c.calls)
+check("旧地址已不在时补新，并对旧地址发一次幂等删除",
+      c.calls == [("add", "1.2.3.4:29873"), ("del", "9.9.9.9:29873")], c.calls)
+check("删除是幂等的（核心对不存在的地址也返回成功）", c.addrs == ["1.2.3.4:29873"], c.addrs)
 check("记录迁移到新 IP", d["records"][0]["current"] == "1.2.3.4:29873")
 
 # ===========================================================================
 print("\n[12] 同步：首次添加（无旧地址）")
 # ===========================================================================
-d = {"records": [rec(cur="")]}
+d = doc_of([rec(cur="")])
 c = StubClient([])
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("只 add 一次", c.calls == [("add", "1.2.3.4:29873")], c.calls)
@@ -308,7 +334,7 @@ print("\n[13] 同步：目标已在列表则不重复添加")
 # ===========================================================================
 # 场景：记录的 current 还是空的（比如上次加到一半退出了），但目标 IP
 # 其实已经在核心列表里 → 直接认领，不要重复 add（否则核心会报「已存在」）。
-d = {"records": [rec(cur="")]}
+d = doc_of([rec(cur="")])
 c = StubClient(["1.2.3.4:29873"])
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("不重复 add", c.calls == [], c.calls)
@@ -317,7 +343,7 @@ check("current 被认领", d["records"][0]["current"] == "1.2.3.4:29873")
 # ===========================================================================
 print("\n[14] 同步：控制台不可达")
 # ===========================================================================
-d = {"records": [rec(cur="9.9.9.9:29873")]}
+d = doc_of([rec(cur="9.9.9.9:29873")])
 c = StubClient(["9.9.9.9:29873"], fail_list=True)
 acts = D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
 check("无增删动作", c.calls == [])
@@ -327,13 +353,13 @@ check("动作为 error", acts[0]["action"] == "error")
 # ===========================================================================
 print("\n[15] 同步：IPv6")
 # ===========================================================================
-d = {"records": [rec(host="v6.example.com", cur="")]}
+d = doc_of([rec(host="v6.example.com", cur="")])
 c = StubClient([])
 D.sync_once(d, c, _getaddrinfo=gai_map({"v6.example.com": "2001:db8::1"}))
 check("IPv6 地址带方括号", c.calls == [("add", "[2001:db8::1]:29873")], c.calls)
 check("IPv6 记录写入", d["records"][0]["current"] == "[2001:db8::1]:29873")
 
-d = {"records": [rec(host="v6.example.com", cur="[2001:db8::1]:29873")]}
+d = doc_of([rec(host="v6.example.com", cur="[2001:db8::1]:29873")])
 c = StubClient(["[2001:db8::1]:29873"])
 D.sync_once(d, c, _getaddrinfo=gai_map({"v6.example.com": "2001:db8::2"}))
 check("IPv6 变化时先加后删",
@@ -342,7 +368,7 @@ check("IPv6 变化时先加后删",
 # ===========================================================================
 print("\n[16] 同步：多条记录互相独立")
 # ===========================================================================
-d = {"records": [rec("a.com", cur="1.1.1.1:1"), rec("b.com", cur="2.2.2.2:2")]}
+d = doc_of([rec("a.com", cur="1.1.1.1:1"), rec("b.com", cur="2.2.2.2:2")])
 d["records"][0]["port"] = 1
 d["records"][1]["port"] = 2
 c = StubClient(["1.1.1.1:1", "2.2.2.2:2"])
@@ -358,7 +384,7 @@ st = D.status_view({"interval": 30, "records": [rec(cur="1.2.3.4:29873")]})
 check("含间隔", st["interval"] == 30)
 check("enabled 为真", st["enabled"] is True)
 check("条目含 addr", st["records"][0]["addr"] == "p.example.com:29873")
-check("空清单 enabled 为假", D.status_view({"records": []})["enabled"] is False)
+check("空清单 enabled 为假", D.status_view(doc_of([]))["enabled"] is False)
 
 # ===========================================================================
 print("\n[18] 配置层：peer_servers 恒空")
@@ -424,7 +450,7 @@ check("撤下后 managed 归空", d["managed"] == [], d["managed"])
 d = {"records": [], "managed": ["1.2.3.4:29873"]}
 c = StubClient(["1.2.3.4:29873", "8.8.8.8:9999"])   # 后者是用户手工加的
 D.sync_once(d, c, _getaddrinfo=gai_map({}))
-check("只撤下托管的，手工加的不动", c.addrs == ["8.8.8.8:9999"], c.addrs)
+check("以本页配置为准：手工加的也撤下", c.addrs == [], c.addrs)
 
 # 场景：托管地址有多个，全部撤下
 d = {"records": [], "managed": ["1.2.3.4:1", "5.6.7.8:2"]}
@@ -437,9 +463,11 @@ check("managed 清空", d["managed"] == [])
 d = {"records": [], "managed": ["1.2.3.4:29873"]}
 c = StubClient([])
 acts = D.sync_once(d, c, _getaddrinfo=gai_map({}))
-check("已不存在的托管地址不产生调用", c.calls == [], c.calls)
+check("对已不存在的托管地址仍发一次幂等删除",
+      c.calls == [("del", "1.2.3.4:29873")], c.calls)
 check("managed 照样归空", d["managed"] == [])
-check("不产生错误动作", [a for a in acts if a["action"] == "error"] == [])
+check("不产生错误动作（删除幂等成功）",
+      [a for a in acts if a["action"] == "error"] == [], acts)
 
 # 场景：撤下失败 → managed 保留，下轮继续重试（不能丢）
 d = {"records": [], "managed": ["1.2.3.4:29873"]}
@@ -479,7 +507,131 @@ check("managed 可持久化并读回", D.load_doc(p2)["managed"] == ["1.2.3.4:1"
 check("旧文件无 managed 时回默认空列表",
       D.load_doc(os.path.join(tmp, "nope2.json"))["managed"] == [])
 
-print("\n[21] 文档层：managed 的持久化与合并")
+print("\n[21] 连不上的地址：GET 查不到，也必须能管住")
+# ===========================================================================
+# 本轮的核心修复。控制台 GET /api/peer_servers 只返回**当前连上的**地址，
+# 而 add/DELETE 都是直接读写 SQLite。因此一个永远连不上的地址（域名错、
+# 对端没开、端口不通）会：写进库却从不出现在 GET 里。
+# 修正前：对账以 GET 为准 → 每轮重复 add → 永久刷「已存在」错误，
+#         且清理看不见它 → 永远删不掉、清空清单也删不掉。
+
+
+class CoreLike(object):
+    """还原核心真实行为：
+
+    - add → 写库；若已存在则报「已存在」
+    - GET → **只返回已连上的**（连不上的查不出来）
+    - DELETE → 按字符串删库，删不存在的也返回成功
+    """
+
+    def __init__(self, connected=True):
+        self.db = set()
+        self.conn = set()
+        self.calls = []
+        self.on = connected
+
+    def list_peers(self):
+        return sorted(self.conn), sorted(self.conn), ""
+
+    def add_peer(self, a):
+        self.calls.append(("add", a))
+        if a in self.db:
+            return False, "服务器 '%s' 已存在" % a
+        self.db.add(a)
+        if self.on:
+            self.conn.add(a)
+        return True, ""
+
+    def del_peer(self, a):
+        self.calls.append(("del", a))
+        self.db.discard(a)
+        self.conn.discard(a)
+        return True, ""
+
+
+def _adds(c):
+    return [x for x in c.calls if x[0] == "add"]
+
+
+# 场景：地址永远连不上 → 不会重复入数据库，也不会刷错误日志
+d = doc_of([rec(cur="")])
+c = CoreLike(connected=False)
+errors_seen = 0
+for i in range(4):
+    c.calls.clear()
+    acts = D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
+    errors_seen += len([a for a in acts if a["action"] == "error"])
+    if i == 0:
+        check("首轮登记（连不上也入数据库）", len(_adds(c)) == 1, c.calls)
+        check("已登记进 managed", d["managed"] == ["1.2.3.4:29873"], d["managed"])
+    else:
+        # 每轮会发一次 add 作「是否还在库里」的探测 —— 这是自愈的代价，
+        # 但核心回「已存在」，不会重复入库、也不会产生 error 动作。
+        check("第 %d 轮不产生错误动作" % (i + 1), errors_seen == 0, acts)
+check("核心库中始终只有一条", c.db == {"1.2.3.4:29873"}, c.db)
+check("四轮下来零错误", errors_seen == 0)
+
+# 场景：连不上的地址，IP 变化 → 登记新地址，并删掉旧地址
+d = doc_of([rec(cur="1.2.3.4:29873")], managed=["1.2.3.4:29873"])
+c = CoreLike(connected=False)
+c.db.add("1.2.3.4:29873")                     # 旧的已在库（连不上）
+acts = D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "5.6.7.8"}))
+check("换了新 IP 会登记新地址",
+      ("add", "5.6.7.8:29873") in c.calls, c.calls)
+check("连不上的旧地址被删掉", "1.2.3.4:29873" not in c.db, c.db)
+check("库中只剩新地址", c.db == {"5.6.7.8:29873"}, c.db)
+check("managed 更新为新地址", d["managed"] == ["5.6.7.8:29873"], d["managed"])
+
+# 场景：连不上的地址，清空清单 → 必须能删掉（本轮修复的要点）
+d = doc_of([rec(cur="1.2.3.4:29873")], managed=["1.2.3.4:29873"])
+c = CoreLike(connected=False)
+c.db.add("1.2.3.4:29873")
+d["records"] = []
+acts = D.sync_once(d, c, _getaddrinfo=gai_map({}))
+check("清空清单能删掉连不上的残留", c.db == set(), c.db)
+check("删除被记录为 del",
+      any(a["action"] == "del" and a["addr"] == "1.2.3.4:29873" for a in acts), acts)
+check("managed 归空", d["managed"] == [], d["managed"])
+
+# 场景：连不上，且地址被人从库里删掉 → 下轮应重新登记（自愈）
+d = doc_of([rec(cur="1.2.3.4:29873")], managed=["1.2.3.4:29873"])
+c = CoreLike(connected=False)                 # db 与 conn 都空 → 已被删
+c.calls.clear()
+D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
+check("被删除后能自愈重新登记", c.db == {"1.2.3.4:29873"}, c.db)
+
+# 场景：核心对 add 回「已存在」应视为成功，不记为错误
+d = doc_of([rec(cur="")])
+c = CoreLike(connected=False)
+c.db.add("1.2.3.4:29873")                     # 已在库但连不上
+acts = D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
+check("「已存在」不产生 error 动作",
+      [a for a in acts if a["action"] == "error"] == [], acts)
+check("「已存在」动作为 keep（已登记未连上）",
+      [a for a in acts if a["addr"] == "1.2.3.4:29873"][0]["action"] == "keep", acts)
+check("「已存在」后仍纳入 managed", d["managed"] == ["1.2.3.4:29873"], d["managed"])
+
+# 场景：核心重启后从 SQLite 恢复记录；连不上的仍查不到，但 IP 变化时能换掉
+d = doc_of([rec(cur="1.2.3.4:29873")], managed=["1.2.3.4:29873"])
+c = CoreLike(connected=False)
+c.db.add("1.2.3.4:29873")                     # 重启后从库里恢复（连不上）
+check("连不上的记录不在 GET 列表里", c.list_peers()[0] == [], c.list_peers()[0])
+D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "7.7.7.7"}))
+check("核心重启后仍能换掉连不上的旧地址",
+      c.db == {"7.7.7.7:29873"}, c.db)
+
+# 场景：域名解析失败时，其已登记地址绝不能被清理阶段误删
+d = doc_of([rec(cur="5.5.5.5:29873")], managed=["5.5.5.5:29873"])
+c = CoreLike()
+c.db.add("5.5.5.5:29873")
+c.calls.clear()
+acts = D.sync_once(d, c, _getaddrinfo=gai_map({}))     # 解析失败
+check("解析失败时不删除其地址", c.db == {"5.5.5.5:29873"}, c.db)
+check("解析失败时不发起写操作", c.calls == [], c.calls)
+check("解析失败记为 error", any(a["action"] == "error" for a in acts), acts)
+check("解析失败时 managed 保持", d["managed"] == ["5.5.5.5:29873"], d["managed"])
+
+print("\n[22] 文档层：managed 的持久化与合并")
 # ===========================================================================
 # managed 是「从有到无」能生效的唯一依据，必须保证它不被各条写入路径弄丢。
 p3 = os.path.join(tmp, "dns-mgd2.json")
@@ -498,7 +650,7 @@ check("老文件缺 managed 键不报错", D.load_doc(p3)["managed"] == [])
 merged = D.merge_records([], [])
 check("merge_records 只返回记录列表", isinstance(merged, list) and merged == [])
 
-print("\n[22] 控制台客户端：登录 / 401 重登 / 地址转义")
+print("\n[23] 控制台客户端：登录 / 401 重登 / 地址转义")
 # ===========================================================================
 import urllib.error  # noqa: E402
 

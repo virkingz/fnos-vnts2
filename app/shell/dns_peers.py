@@ -269,6 +269,18 @@ def records_of(doc):
     return doc.get("records") or []
 
 
+# 核心 add 遇到同地址会 bail「服务器 'x' 已存在」。
+# 这**不是失败** —— 说明该地址已在数据库里（只是没连上，所以不出现在
+# GET 列表里）。把它当成功处理，既避免每轮刷错误日志，又保住自愈能力：
+# 万一记录被人删掉，下次 add 会真的成功，我们据此得知需要重新登记。
+_EXISTS_HINTS = ("已存在", "exist", "already")
+
+
+def is_already_exists(msg):
+    m = str(msg or "").lower()
+    return any(h in m for h in _EXISTS_HINTS)
+
+
 def desired_addr(rec, _getaddrinfo=None):
     """算出该记录「应该」在核心里的地址。返回 (addr, error)。
 
@@ -480,33 +492,44 @@ class ConsoleClient(object):
 # 单轮同步（本模块的核心，全部纯度可测）
 # ---------------------------------------------------------------------------
 def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
-    """按配置清单与核心出站列表做一轮**完全对账**，原地修改 doc。
+    """按配置清单与核心**实际注册过的**出站地址做一轮完全对账，原地修改 doc。
 
-    返回 actions 列表（供界面与日志展示）。每项形如：
+    返回 actions 列表。每项形如：
         {"host":.., "action":"add"|"del"|"keep"|"error", "addr":.., "msg":..}
 
-    对账口径：**以 dns-ip.json 清单为唯一真源**。核心出站列表里凡是
-    不在清单中的地址，一律删除 —— 包括：
-      - 我们上一次同步留下的旧 IP；
-      - 先加新、尚未来得及删旧就重启核心而残留的多余记录；
-      - 在控制台手工添加的地址。
+    ## 必须绕开的陷阱
 
-    这样做的好处是「幂等收敛」：无论中间被打断多少次，最终状态一定
-    等于清单所要求的状态，不会越积越多。
+    控制台 `GET /api/peer_servers` 返回的是**「当前连上的」**地址，而不是
+    「核心里注册过的」地址 —— 内存列表只在认证成功后 push（peer_server.rs）。
+    而 `add` 直接写 SQLite，`DELETE` 直接按字符串删 SQLite，都不看连接状态。
 
-    分两阶段，顺序不可颠倒：
+    于是**永远连不上**的地址（域名错、对端没开、端口不通）会：
+      - 成功写进数据库，却**永远不出现在 GET 列表里**；
+      - 让「以 GET 为准」的对账每轮重复 add → 核心回「已存在」→ 永久刷错误；
+      - 清理阶段看不见它 → **永远删不掉，清空清单也删不掉**。
 
-      阶段一（补齐 + 换旧）：逐条解析域名 → 确保目标地址存在 → 删掉该条的旧地址。
-        解析失败时**该条原地不动**（保留旧地址），避免一次 DNS 抖动断掉互联。
-      阶段二（清理残留）：删除出站列表里所有不属于清单的地址。
-        放在最后是为了不误删「本轮刚加的新地址还没确认就清理」。
+    所以：**判定基准取 `GET 列表 ∪ doc["managed"]`**，两者哪个都不完整，
+    合起来才能覆盖「连上的」「没连上的」两种已注册地址。
 
-    **清单为空 = 撤下全部托管地址**（从有到无）：
-    不再早退，而是删除 doc["managed"] 里记录的、我们曾加进去的地址。
-    不能删「所有出站地址」—— 那会误伤用户在控制台手工添加的互联。
+    ## 如何区分「已登记但没连上」与「已被删掉」
 
-    安全约束：只处理 outbound（核心主动外连的）地址，绝不碰 inbound
-    （别的服务端连进来的），那些不是我们的管辖范围。
+    仅凭记录无法区分。因此对**不在 GET 列表里的**目标地址，直接调一次 add：
+      - 返回成功 → 原本已被删，现已重新登记（自愈）；
+      - 返回「已存在」→ 原本就在数据库里，只是没连上。
+    两者都算成功，既不会误判，也不会刷错误日志。
+
+    ## 对账规则
+
+    阶段一：逐条解析域名 → 得到目标地址 want。
+      - want 已连上（在 GET 列表）→ 无需任何操作。
+      - 否则尝试 add；「已存在」视为成功。
+      - 该条旧地址 cur 已不再需要 → 删除。add 失败时绝不删 cur（否则互联会断）。
+    阶段二：删除「已注册但本轮不再需要」的地址，即
+      `(GET列表 ∪ managed) - 目标集 - 本轮需保护的旧地址`。
+      这是「从有到无」的落点，且因为不依赖 GET 列表，连不上的残留照样能删掉。
+
+    安全约束：不碰 inbound（别的服务端连进来的，不在 GET 的 outbound 里），
+    也不误删用户在控制台手工添加且仍需要的地址。
     """
     now = int(now if now is not None else time.time())
     actions = []
@@ -526,142 +549,130 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
                             "addr": "", "msg": err})
         return actions
 
-    # ---- 清单为空：撤下所有托管地址（从有到无的关键路径）----
-    if not records:
-        for addr in managed:
-            if addr not in out_addrs:
-                continue
-            ok, derr = client.del_peer(addr)
-            if ok:
+    def _del(addr, host, msg):
+        """删除已注册地址。返回是否成功。"""
+        ok, derr = client.del_peer(addr)
+        if ok:
+            if addr in out_addrs:
                 out_addrs.remove(addr)
-                actions.append({"host": "", "action": "del", "addr": addr,
-                                "msg": "清单已清空，撤下托管地址"})
+            actions.append({"host": host, "action": "del", "addr": addr, "msg": msg})
+            return True
+        actions.append({"host": host, "action": "error", "addr": addr, "msg": derr})
+        return False
+
+    # ---- 清单为空：撤下所有登记过的地址（从有到无的关键路径）----
+    # 基准取「managed ∪ 连上的出站地址」：前者覆盖连不上的死记录，
+    # 后者覆盖用户在控制台手工加的（用户要求以本页配置为准）。
+    if not records:
+        keep = []
+        for addr in sorted(set(managed) | set(out_addrs)):
+            if _del(addr, "", "清单已清空，撤下托管地址"):
                 _log("清单已清空，撤下托管地址：%s" % addr)
             else:
-                actions.append({"host": "", "action": "error", "addr": addr,
-                                "msg": derr})
-                _log("撤下托管地址 %s 失败：%s" % (addr, derr))
-        # 全部撤下成功才清空 managed；有失败则保留，下轮继续重试
-        failed = [a for a in actions if a.get("action") == "error"]
-        doc["managed"] = [] if not failed else managed
+                keep.append(addr)          # 删除失败 → 下轮重试
+        doc["managed"] = keep
         doc["records"] = []
         return actions
 
-    # 清单要求的目标地址集合。
-    #
-    # 清理阶段的安全性依据：它只删「不在 wanted 里的出站地址」，而每个我们
-    # 加过的地址必然属于下列之一，因而都受保护：
-    #   - 解析成功 → 目标地址进 wanted，旧地址由阶段一亲自删除；
-    #   - 解析失败 → 其 current 进 wanted，不会因一次 DNS 抖动被清掉。
-    # 所以即便存在永久解析失败的条目，清理也只影响真正的残留记录。
-    wanted = set()
-    resolved = {}          # id(rec) -> (want, cur)
+    # 每条记录的目标地址。解析失败的沿用其 current（原样保留，不视为残留）。
+    want_of = {}
+    res_err = {}
     for rec in records:
-        host = rec.get("host") or ""
         want, rerr = desired_addr(rec, _getaddrinfo=_getaddrinfo)
-        cur = (rec.get("current") or "").strip()
         if rerr:
+            res_err[id(rec)] = rerr
+            cur = (rec.get("current") or "").strip()
             if cur:
-                wanted.add(cur)      # 解析失败：保留旧地址，且不视为残留
-            continue
-        wanted.add(want)
-        resolved[id(rec)] = (want, cur)
+                want_of[id(rec)] = cur
+        else:
+            want_of[id(rec)] = want
 
-    # ---- 阶段一：补齐目标地址，并删掉该条的旧地址 ----
+    target = set(want_of.values())
+    protect = set()             # 本轮因 add 失败而必须保留的旧地址
+    managed_set = set(managed)
+
+    # ---- 阶段一：登记目标地址，并撤下该条已不用的旧地址 ----
     for rec in records:
         host = rec.get("host") or ""
-        pair = resolved.get(id(rec))
-        if pair is None:
-            rerr = desired_addr(rec, _getaddrinfo=_getaddrinfo)[1]
+        rerr = res_err.get(id(rec))
+        if rerr:
             rec["last_error"] = rerr
             actions.append({"host": host, "action": "error",
                             "addr": rec.get("current") or "", "msg": rerr})
             _log("域名解析失败，保留原地址：%s —— %s" % (host, rerr))
             continue
 
-        want, cur = pair
+        want = want_of[id(rec)]
+        cur = (rec.get("current") or "").strip()
 
-        # 判定基准是「核心实际列表」，而非记录里的 current。
-        # 这样即使记录被人在控制台删掉，也能自动补回（自愈）。
-        if want not in out_addrs:
+        if want in out_addrs:
+            # 已连上 → 必然已登记，无需 add
+            actions.append({"host": host, "action": "keep", "addr": want, "msg": ""})
+        else:
+            # 不在已连列表：可能没连上（已登记），也可能已被删（需重新登记）。
+            # 直接 add 探测：「已存在」与成功都算登记完成。
             ok, aerr = client.add_peer(want)
-            if not ok:
-                # 加失败 → 绝不删旧地址，否则互联会断
+            if ok or is_already_exists(aerr):
+                if is_already_exists(aerr):
+                    actions.append({"host": host, "action": "keep",
+                                    "addr": want, "msg": "已登记（未连上）"})
+                else:
+                    actions.append({"host": host, "action": "add",
+                                    "addr": want, "msg": ""})
+                    _log("已登记互联地址：%s（%s）" % (want, host))
+                managed_set.add(want)
+            else:
+                # 登记失败 → 绝不删旧地址，否则互联会断
+                if cur:
+                    protect.add(cur)
                 rec["last_error"] = aerr
                 actions.append({"host": host, "action": "error",
                                 "addr": cur, "msg": aerr})
-                _log("添加 %s 失败，保留原地址 %s：%s" % (want, cur or "(无)", aerr))
+                _log("登记 %s 失败，保留原地址 %s：%s" % (want, cur or "(无)", aerr))
                 continue
-            out_addrs.append(want)
-            actions.append({"host": host, "action": "add", "addr": want, "msg": ""})
-            _log("已添加互联地址：%s（%s）" % (want, host))
-        elif cur == want:
-            # 地址未变、且确实在列表里 → 无需任何写操作
-            rec["last_error"] = ""
-            rec["last_sync"] = now
-            rec["last_ok"] = now
-            actions.append({"host": host, "action": "keep", "addr": want, "msg": ""})
-            continue
 
-        # 新地址就位后，再删自己名下的旧地址
-        if cur and cur != want and cur in out_addrs:
-            ok, derr = client.del_peer(cur)
-            if ok:
-                out_addrs.remove(cur)
+        # 目标已就位，再撤下该条已不用的旧地址。
+        # 仅当它确实还注册着（在已连列表或 managed 里）才调删除 —— 否则会
+        # 对早被删掉的地址反复发 DELETE，既多余又刷日志。
+        if cur and cur != want and (cur in out_addrs or cur in managed_set):
+            if _del(cur, host, "旧地址已被新 IP 取代"):
                 rec["previous"] = cur
-                actions.append({"host": host, "action": "del", "addr": cur, "msg": ""})
+                managed_set.discard(cur)
                 _log("已移除旧互联地址：%s（%s）" % (cur, host))
             else:
-                # 删除失败不算致命：新地址已在，阶段二/下一轮会再试
-                rec["last_error"] = derr
-                actions.append({"host": host, "action": "error",
-                                "addr": cur, "msg": derr})
-                _log("移除旧地址 %s 失败（新地址已生效）：%s" % (cur, derr))
+                rec["last_error"] = actions[-1]["msg"]
 
         rec["current"] = want
         rec["last_sync"] = now
         rec["last_ok"] = now
         rec["last_error"] = ""
 
-    # ---- 阶段二：清理出站列表里所有不属于清单的残留 ----
-    # 覆盖「先加后删中途重启」留下的多余记录，以及在控制台手工加的地址。
+    # ---- 阶段二：撤下「已注册但本轮不再需要」的地址 ----
+    # 覆盖：先加新未删旧就重启核心留下的残留、控制台手工增删造成的偏差、
+    # 以及**连不上因此从不出现在 GET 列表里的死记录**。
     #
-    # protected 同时收纳「每条记录的 current」：阶段一在添加失败时会跳过
-    # 删除旧地址，若这里不保护它，清理就会把旧地址删掉 —— 那正是
-    # 「加失败绝不删旧」要防的事故。真正的残留（例如上一轮已把 current
-    # 更新为新 IP 后遗留的旧 IP）不在任何记录的 current 里，仍会被清掉。
-    protected = set(wanted)
-    for rec in records:
-        c = (rec.get("current") or "").strip()
-        if c:
-            protected.add(c)
-
-    for addr in list(out_addrs):
-        if addr in protected:
-            continue
-        ok, derr = client.del_peer(addr)
-        if ok:
-            out_addrs.remove(addr)
-            actions.append({"host": "", "action": "del", "addr": addr,
-                            "msg": "不在配置清单中，已清理"})
+    # out_addrs 里已被阶段一删掉的地址不会重复处理：_del 成功时会从
+    # out_addrs 移除，to_clean 因此不会再包含它。
+    to_clean = (set(out_addrs) | managed_set) - target - protect
+    for addr in sorted(to_clean):
+        if _del(addr, "", "不在配置清单中，已清理"):
+            managed_set.discard(addr)
             _log("清理多余互联地址：%s（不在配置清单中）" % addr)
         else:
-            actions.append({"host": "", "action": "error", "addr": addr,
-                            "msg": derr})
-            _log("清理多余地址 %s 失败：%s" % (addr, derr))
+            _log("清理多余地址 %s 失败：%s" % (addr, actions[-1]["msg"]))
 
-    # 重建 managed：清单要求的目标地址，加上仍受保护的历史托管地址
-    # （解析失败的条目、以及删除失败待重试的残留）。
-    # 这样「从有到无」时能凭它精确撤下我们加过的地址。
-    keep_managed = set(wanted)
-    keep_managed.update(protected)
-    if not actions or all(a.get("action") != "error" for a in actions):
-        # 本轮无异常 → 托管集合就是清单目标，丢掉一切历史痕迹
-        doc["managed"] = sorted(wanted)
-    else:
-        # 有失败项 → 保留其地址，下一轮继续重试
-        doc["managed"] = sorted(keep_managed)
+    # ---- 阶段二：撤下「已注册但本轮不再需要」的地址 ----
+    # 覆盖：先加新未删旧就重启核心留下的残留、控制台手工增删造成的偏差、
+    # 以及**连不上因此从不出现在 GET 列表里的死记录**。
+    to_clean = (set(out_addrs) | managed_set) - target - protect
+    for addr in sorted(to_clean):
+        if _del(addr, "", "不在配置清单中，已清理"):
+            managed_set.discard(addr)
+            _log("清理多余互联地址：%s（不在配置清单中）" % addr)
+        else:
+            _log("清理多余地址 %s 失败：%s" % (addr, actions[-1]["msg"]))
 
+    doc["managed"] = sorted(managed_set)
     return actions
 
 
