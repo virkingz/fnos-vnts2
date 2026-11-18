@@ -19,7 +19,7 @@
 
 ## 下载
 
-到 [Releases](https://github.com/virkingz/vnts2-fnos/releases) 下载最新的 `vnts-nas.fpk`。
+到 [Releases](https://github.com/virkingz/fnos-vnts2/releases) 下载最新的 `fnos-vnts2.fpk`。
 
 ## Docker 部署
 
@@ -29,6 +29,10 @@
 cd docker
 docker compose up -d
 ```
+
+默认从 GHCR 拉取多架构官方镜像 `ghcr.io/virkingz/fnos-vnts2:latest`
+（打 tag 时自动更新）。想本地构建：注释掉 compose 里的 `image:`、
+取消 `build:` 注释，再 `docker compose up -d --build`。
 
 访问 `http://<主机>:19098` 即为管理页。完整说明见 **[docker/README.md](docker/README.md)**。
 
@@ -44,12 +48,12 @@ docker compose up -d
 
 ## 安装
 
-飞牛桌面 → 应用中心 → 右上角菜单 → 安装本地应用 → 选择 `vnts-nas.fpk`。
+飞牛桌面 → 应用中心 → 右上角菜单 → 安装本地应用 → 选择 `fnos-vnts2.fpk`。
 
 或命令行：
 
 ```bash
-appcenter-cli install-fpk vnts-nas.fpk
+appcenter-cli install-fpk fnos-vnts2.fpk
 ```
 
 **安装时填两个端口**（都有默认值，通常直接下一步即可）：
@@ -243,7 +247,7 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 ## 打包与测试
 
 ```bash
-bash scripts/pack.sh            # 产出 vnts-nas.fpk
+bash scripts/pack.sh            # 产出 fnos-vnts2.fpk
 bash scripts/pack.sh 1.0.1      # 指定版本
 
 python scripts/test_e2e.py            # 端到端（29 项）

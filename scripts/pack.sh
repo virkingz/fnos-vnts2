@@ -7,15 +7,16 @@ set -euo pipefail
 PROJ="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJ"
 
-NAME="vnts-nas"
+NAME="vnts-nas"          # 包名（appname）：决定安装路径与网关前缀，保持不变
+ARTIFACT="fnos-vnts2"    # 制品名：fpk 文件名与仓库、Docker 镜像保持一致
 STAGE="build/.stage"
-OUT="$PROJ/${NAME}.fpk"
+OUT="$PROJ/${ARTIFACT}.fpk"
 
 if [ -n "${1:-}" ]; then
     sed -i.bak "s/^version[[:space:]]*=.*/version = ${1}/" manifest && rm -f manifest.bak
 fi
 VERSION="$(grep -E '^version' manifest | head -1 | sed 's/.*=[[:space:]]*//')"
-echo "==> 打包 $NAME v$VERSION"
+echo "==> 打包 $NAME v$VERSION  →  ${ARTIFACT}.fpk"
 
 python scripts/gen_icons.py >/dev/null 2>&1 || python3 scripts/gen_icons.py >/dev/null
 cp -f app/ui/images/icon_256.png app/shell/web/icon.png

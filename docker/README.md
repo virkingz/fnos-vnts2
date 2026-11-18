@@ -48,13 +48,13 @@ volumes:
 
 ```bash
 # 旧机器：只导出数据卷（不含日志）
-docker run --rm -v vnts-nas_vnts-data:/data -v "$PWD":/backup alpine \
+docker run --rm -v fnos-vnts2_vnts-data:/data -v "$PWD":/backup alpine \
     tar czf /backup/vnts-data.tgz -C /data .
 
 # 或者更简单：用管理页「配置导入导出 → 导出为 zip」（只含配置与数据库）
 
 # 新机器：恢复
-docker run --rm -v vnts-nas_vnts-data:/data -v "$PWD":/backup alpine \
+docker run --rm -v fnos-vnts2_vnts-data:/data -v "$PWD":/backup alpine \
     sh -c "tar xzf /backup/vnts-data.tgz -C /data"
 ```
 
@@ -94,13 +94,13 @@ tar czf vnts-data.tgz --exclude=./log -C /data .
 ## 直接跑镜像（不用 compose）
 
 ```bash
-docker run -d --name vnts-nas \
+docker run -d --name fnos-vnts2 \
   -p 19098:19098 -p 29872:29872/tcp -p 29872:29872/udp \
   -e LOG_DIR=/data/log \
   -v vnts-data:/data \
   -v vnts-logs:/data/log \
   --restart unless-stopped \
-  ghcr.io/virkingz/vnts2-fnos:latest
+  ghcr.io/virkingz/fnos-vnts2:latest
 ```
 
 ## 多架构
@@ -113,7 +113,7 @@ docker run -d --name vnts-nas \
 
 | 现象 | 处理 |
 |------|------|
-| 管理页打不开 | `docker logs vnts-nas`；确认 19098 已映射 |
+| 管理页打不开 | `docker logs fnos-vnts2`；确认 19098 已映射 |
 | 客户端连不上 | 确认 29872 **TCP 与 UDP** 都映射了 |
 | 核心下载失败 | 加 `MIRROR` 或 `PROXY` 后重启容器 |
 | 想改端口 | 改 compose 的 ports 与对应环境变量，重启 |

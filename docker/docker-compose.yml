@@ -1,11 +1,15 @@
-# vnts-nas 一键部署
+# fnos-vnts2 一键部署
 #
-# 【本地构建并运行】
+# 【方式一：直接用官方镜像（默认，推荐）】
 #   cd docker && docker compose up -d
+#   镜像来自 GHCR，多架构（amd64 / arm64 / armv7），打 tag 时自动更新 latest。
 #
-# 【直接用 CI 构建好的镜像】
-#   把 build: 三段整体注释掉，并把 image: 改成：
-#     image: ghcr.io/virkingz/vnts2-fnos:latest
+# 【方式二：本地构建】
+#   把 image: 一行注释掉，并把 build: 那两行取消注释，然后：
+#   cd docker && docker compose up -d --build
+#
+# 【固定版本】
+#   把 image 的 :latest 换成具体版本，如 :v1.0.0
 #
 # 端口说明：
 #   19098/tcp  管理页（含内嵌控制台）
@@ -21,12 +25,13 @@
 #   日志就会落在 /data/log（仍在数据卷内，但依然与配置分离）。
 
 services:
-  vnts-nas:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: vnts-nas:latest
-    container_name: vnts-nas
+  fnos-vnts2:
+    # 默认用官方镜像；想本地构建就注释掉 image、取消下面 build 的注释
+    image: ghcr.io/virkingz/fnos-vnts2:latest
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
+    container_name: fnos-vnts2
     restart: unless-stopped
 
     ports:

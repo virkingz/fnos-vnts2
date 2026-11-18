@@ -1,18 +1,18 @@
-# vnts-nas —— VNT 服务端（vnts2 壳）Docker 镜像
+# fnos-vnts2 —— VNT 服务端（vnts2 壳）Docker 镜像
 #
 # 与 fpk 版共用同一套 app/shell 代码，只是把飞牛注入的 TRIM_* 换成容器内自定，
 # 因此不需要修改任何原有源码。
 #
 # 构建（仓库根目录）：
-#   docker build -f docker/Dockerfile -t vnts-nas:latest .
+#   docker build -f docker/Dockerfile -t fnos-vnts2:latest .
 #
 # 多架构：vnts2 核心是运行时按 uname -m 下载的静态 musl 二进制，
 # 壳本身是纯 Python，同一个 Dockerfile 可直接构建 amd64 / arm64 / armv7。
 FROM alpine:3.20
 
-LABEL org.opencontainers.image.title="vnts-nas" \
+LABEL org.opencontainers.image.title="fnos-vnts2" \
       org.opencontainers.image.description="VNT 服务端（vnts2 壳）：核心在线更新、服务端配置、配置导入导出、独立日志目录" \
-      org.opencontainers.image.source="https://github.com/virkingz/fnos-vnts" \
+      org.opencontainers.image.source="https://github.com/virkingz/fnos-vnts2" \
       org.opencontainers.image.licenses="MIT"
 
 # python3   壳本体与配置生成
