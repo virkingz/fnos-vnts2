@@ -104,7 +104,8 @@ def main():
         z = zipfile.ZipFile(io_bytes(zb))
         names = z.namelist()
         check("导出含 config.toml", any("config.toml" in n for n in names), names)
-        check("导出含 settings.json", any("settings.json" in n for n in names), names)
+        check("导出不含 settings.json（已并入 config.toml）",
+              not any("settings.json" in n for n in names), names)
         check("导出不含日志", not any(n.endswith(".log") for n in names), names)
         check("导出不含核心二进制", not any("vnts2" in n and n.endswith("vnts2") for n in names))
 
@@ -116,6 +117,8 @@ def main():
                        "username": "boss", "password": "pw123456",
                    }).encode())
         check("保存设置成功", c == 200, b[:120])
+        saved = json.loads(b.decode())["data"]
+        check("保存不再自动重启核心（无 restarted 字段）", "restarted" not in saved, saved)
         c, b = get(url + "/panel-api/settings", {"X-Panel-Token": token})
         s = json.loads(b.decode())["data"]
         check("网段已保存", s["network"] == "10.88.0.0/24", s.get("network"))
@@ -123,6 +126,9 @@ def main():
         cfg = open(os.path.join(var, "server", "config.toml"), encoding="utf-8").read()
         check("config.toml 已同步网段", '10.88.0.0/24' in cfg)
         check("config.toml 已同步白名单", '"2001"' in cfg)
+        check("server 目录只有一个配置文件（无 settings.json）",
+              not os.path.exists(os.path.join(var, "server", "settings.json")),
+              sorted(os.listdir(os.path.join(var, "server"))))
 
         print("\n[6] 日志默认位置与 log4rs 指向")
         check("默认日志目录 = 数据目录/log", state["log_dir"] == os.path.join(var, "log"),

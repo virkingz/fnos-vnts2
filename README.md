@@ -181,7 +181,7 @@ appcenter-cli install-fpk fnos-vnts2.fpk
 
 「配置导入导出」标签（也可在 Docker 下用）：
 
-- **导出**：打包 `config.toml`、`settings.json`、`network_control.db`（网络/设备记录）、
+- **导出**：打包 `config.toml`（唯一配置文件）、`network_control.db`（网络/设备记录）、
   证书文件为一个 zip。**不含日志**，也不含核心二进制。用于迁移到新机器或定期备份。
 - **导入**：选择之前导出的 zip。导入前**自动备份**现有 `server/` 目录，失败**自动回滚**。
   导入后核心自动重启。
@@ -296,8 +296,7 @@ $TRIM_PKGVAR/            # /vol{n}/@appdata/vnts-nas
 │   ├── panel_token       # 管理页令牌（0600）
 │   └── .vnts_version     # 当前核心版本
 ├── server/               # vnts2 工作目录（CWD）
-│   ├── config.toml       # 服务端配置
-│   ├── settings.json     # 管理页表单的持久化形式
+│   ├── config.toml       # 服务端配置（唯一配置文件，界面直接读写）
 │   ├── network_control.db# 网络与设备记录（SQLite）
 │   └── logs/log4rs.yaml  # 仅日志配置，无日志数据
 ├── cache/                # 下载缓存 + 回滚备份 + 导入前备份

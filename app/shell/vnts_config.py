@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""vnts-nas 服务端配置生成与读写。
+"""vnts-nas 服务端配置读写。
 
 职责：
-  1. 把管理页的「服务端设置」(settings.json) 渲染成 vnts2 的 config.toml。
+  1. 读写 vnts2 的 config.toml —— **它是唯一的服务端配置文件**，
+     管理页直接读写它，不再另存一份 settings.json。
   2. 预写 server/logs/log4rs.yaml，把 vnts2 自身日志指向独立日志目录
      —— 这是「日志与配置分离」的关键：日志写 LOG_DIR，绝不留在 server/。
-  3. 反向解析 config.toml -> settings.json，便于导入后同步界面。
 
 vnts2 的日志路径规则（源码 utils/log.rs）：
   - 固定使用 CWD 下的 logs/ 目录，log_init("vnts2") 会创建
@@ -19,7 +19,7 @@ logs/ 目录里就只剩这份几百字节的 yaml（配置，可导出），没
 命令行：
   render --server-dir DIR --log-dir DIR [--ports-file F]
   settings-get --server-dir DIR
-  settings-set --server-dir DIR --json '{"...":...}'
+  settings-set --server-dir DIR --json '{"...":...}' [--ports-file F]
   config-to-settings --server-dir DIR
 
 仅使用 Python 标准库，兼容 Python 3.8+。
@@ -31,7 +31,9 @@ import os
 import re
 import sys
 
-SETTINGS_FILE = "settings.json"
+# 旧版本把设置另存为 settings.json；现在 config.toml 是唯一真源。
+# 这个常量只用于「一次性迁移」：把历史 settings.json 并回 config.toml 后删除。
+LEGACY_SETTINGS_FILE = "settings.json"
 
 # ---------------------------------------------------------------------------
 # 默认设置
@@ -65,37 +67,65 @@ DEMO_PASSWORD = "admin"
 
 
 # ---------------------------------------------------------------------------
-# 读写 settings.json
+# 读写 config.toml —— 唯一的服务端配置文件
 # ---------------------------------------------------------------------------
-def settings_path(server_dir):
-    return os.path.join(server_dir, SETTINGS_FILE)
+def config_path(server_dir):
+    return os.path.join(server_dir, "config.toml")
 
 
-def load_settings(server_dir):
+def _default_settings():
+    """DEFAULTS 的可变副本（列表/字典要深拷，避免调用方互相污染）。"""
     s = dict(DEFAULTS)
     s["white_list"] = list(DEFAULTS["white_list"])
     s["custom_nets"] = dict(DEFAULTS["custom_nets"])
     s["group_types"] = dict(DEFAULTS["group_types"])
     s["peer_servers"] = list(DEFAULTS["peer_servers"])
     s["traffic_servers"] = list(DEFAULTS["traffic_servers"])
-    p = settings_path(server_dir)
-    if os.path.isfile(p):
-        try:
-            raw = json.load(open(p, encoding="utf-8"))
-            if isinstance(raw, dict):
-                for k, v in raw.items():
-                    s[k] = v
-        except (OSError, ValueError):
-            pass
     return s
 
 
-def save_settings(server_dir, s):
+def read_ports(ports_file=None):
+    """从 ports.env 读 SERVICE_PORT / CONSOLE_PORT（缺省用官方默认值）。"""
+    service_port, console_port = 29872, 29071
+    if ports_file and os.path.isfile(ports_file):
+        for line in open(ports_file, encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if line.startswith("SERVICE_PORT="):
+                try:
+                    service_port = int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith("CONSOLE_PORT="):
+                try:
+                    console_port = int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+    return service_port, console_port
+
+
+def load_settings(server_dir):
+    """解析 config.toml 得到界面用的设置字典；文件不存在则返回默认值。"""
+    s = _default_settings()
+    p = config_path(server_dir)
+    if not os.path.isfile(p):
+        return s
+    try:
+        text = open(p, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return s
+    _apply_toml(s, parse_toml_simple(text))
+    return s
+
+
+def save_settings(server_dir, s, ports_file=None):
+    """把设置写回 config.toml。端口不落进设置里，渲染时从 ports.env 取。"""
     os.makedirs(server_dir, exist_ok=True)
-    p = settings_path(server_dir)
+    service_port, console_port = read_ports(ports_file)
+    cfg = render_config_toml(s, service_port, console_port)
+    p = config_path(server_dir)
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write(cfg)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, p)
@@ -103,6 +133,32 @@ def save_settings(server_dir, s):
         os.chmod(p, 0o600)
     except OSError:
         pass
+    return p
+
+
+def _migrate_legacy_settings(server_dir):
+    """把旧版 settings.json 并回 config.toml 后删除，确保只剩一个配置文件。
+
+    - 只有 settings.json、没有 config.toml → 用它生成 config.toml（不丢设置）
+    - 两者都在 → config.toml 才是 vnts2 实际读的那份，直接删掉 settings.json
+    删除永远是最后一步：config.toml 确认存在才动手。
+    """
+    legacy = os.path.join(server_dir, LEGACY_SETTINGS_FILE)
+    if not os.path.isfile(legacy):
+        return False
+    try:
+        if not os.path.isfile(config_path(server_dir)):
+            raw = json.load(open(legacy, encoding="utf-8"))
+            s = _default_settings()
+            if isinstance(raw, dict):
+                s.update(raw)
+            save_settings(server_dir, s)
+        if os.path.isfile(config_path(server_dir)):
+            os.remove(legacy)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -295,43 +351,24 @@ def render_log4rs(log_dir, level="info", max_mb=10, keep=5):
 # ---------------------------------------------------------------------------
 # 渲染全部
 # ---------------------------------------------------------------------------
-def render(server_dir, log_dir, ports_file=None):
+def render(server_dir, log_dir, ports_file=None, settings=None):
+    """渲染 config.toml 与 logs/log4rs.yaml。
+
+    settings 传入时用它（保存设置场景，避免「读—改—写」间的竞态）；
+    否则从现有 config.toml 读。
+    """
     os.makedirs(server_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
-    # 端口：优先取 ports.env 的 SERVICE_PORT / CONSOLE_PORT
-    service_port = 29872
-    console_port = 29071
-    if ports_file and os.path.isfile(ports_file):
-        for line in open(ports_file, encoding="utf-8", errors="replace"):
-            line = line.strip()
-            if line.startswith("SERVICE_PORT="):
-                try:
-                    service_port = int(line.split("=", 1)[1])
-                except ValueError:
-                    pass
-            elif line.startswith("CONSOLE_PORT="):
-                try:
-                    console_port = int(line.split("=", 1)[1])
-                except ValueError:
-                    pass
+    # 一次性迁移：老版本的 settings.json 并进来后删除
+    _migrate_legacy_settings(server_dir)
 
-    s = load_settings(server_dir)
+    s = settings if settings is not None else load_settings(server_dir)
     errs = validate(s)
     if errs:
         raise SystemExit("配置校验失败: " + "; ".join(errs))
 
-    # settings.json 落盘：保证首次生成后即可导出，且界面与文件一致
-    if not os.path.isfile(settings_path(server_dir)):
-        save_settings(server_dir, s)
-
-    # config.toml
-    cfg = render_config_toml(s, service_port, console_port)
-    cfg_path = os.path.join(server_dir, "config.toml")
-    tmp = cfg_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(cfg)
-    os.replace(tmp, cfg_path)
+    cfg_path = save_settings(server_dir, s, ports_file)
 
     # logs/log4rs.yaml —— 让 vnts2 把日志写进独立 LOG_DIR
     logs_dir = os.path.join(server_dir, "logs")
@@ -346,7 +383,7 @@ def render(server_dir, log_dir, ports_file=None):
 
 
 # ---------------------------------------------------------------------------
-# config.toml -> settings（导入用）
+# config.toml -> settings（界面读取的唯一入口）
 # ---------------------------------------------------------------------------
 def parse_toml_simple(text):
     """极简 TOML 解析：只支持本模块生成的形态（顶层键值 + 字符串数组 + 表）。"""
@@ -444,15 +481,8 @@ def _unquote(x):
     return x.replace('\\"', '"').replace("\\\\", "\\")
 
 
-def config_to_settings(server_dir):
-    """解析 config.toml，合并进 settings（保留界面已有项）。"""
-    cfg_path = os.path.join(server_dir, "config.toml")
-    s = load_settings(server_dir)
-    if not os.path.isfile(cfg_path):
-        return s
-    text = open(cfg_path, encoding="utf-8", errors="replace").read()
-    t = parse_toml_simple(text)
-
+def _apply_toml(s, t):
+    """把 parse_toml_simple 的结果映射进设置字典（原地修改并返回）。"""
     if "network" in t:
         s["network"] = t["network"]
     if "lease_duration" in t:
@@ -492,6 +522,11 @@ def config_to_settings(server_dir):
     return s
 
 
+def config_to_settings(server_dir):
+    """兼容旧接口：config.toml 即唯一真源，等价于 load_settings。"""
+    return load_settings(server_dir)
+
+
 def _port_of(bind):
     m = re.search(r":(\d+)\s*$", str(bind))
     return int(m.group(1)) if m else None
@@ -515,6 +550,7 @@ def main(argv=None):
     st = sub.add_parser("settings-set")
     st.add_argument("--server-dir", required=True)
     st.add_argument("--json", required=True)
+    st.add_argument("--ports-file", default=None)
 
     c2s = sub.add_parser("config-to-settings")
     c2s.add_argument("--server-dir", required=True)
@@ -540,14 +576,13 @@ def main(argv=None):
             json.dump({"ok": False, "errors": errs}, sys.stdout, ensure_ascii=False)
             print()
             return 2
-        save_settings(args.server_dir, s)
+        save_settings(args.server_dir, s, args.ports_file)
         json.dump({"ok": True}, sys.stdout, ensure_ascii=False)
         print()
         return 0
     if args.cmd == "config-to-settings":
-        s = config_to_settings(args.server_dir)
-        save_settings(args.server_dir, s)
-        json.dump(s, sys.stdout, ensure_ascii=False, indent=2)
+        # config.toml 已是唯一真源，这里只把映射结果打印出来（不写任何文件）
+        json.dump(load_settings(args.server_dir), sys.stdout, ensure_ascii=False, indent=2)
         print()
         return 0
     return 1

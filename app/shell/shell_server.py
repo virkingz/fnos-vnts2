@@ -294,14 +294,19 @@ def get_settings():
 
 
 def update_settings(patch):
+    """保存服务端设置：直接写 config.toml（唯一配置文件）。
+
+    只落盘，不重启核心 —— 由用户自行决定何时重启使其生效。
+    """
     s = C.load_settings(SERVER_DIR)
     s.update(patch or {})
     errs = C.validate(s)
     if errs:
         return {"ok": False, "errors": errs}
-    C.save_settings(SERVER_DIR, s)
-    render_config()
-    return {"ok": True}
+    ensure_dirs()
+    # 一次渲染同时写出 config.toml 与 logs/log4rs.yaml，避免两次读改写
+    C.render(SERVER_DIR, log_dir(), PORT_FILE, settings=s)
+    return {"ok": True, "restart_needed": core_running()}
 
 
 # ---------------------------------------------------------------------------
@@ -729,9 +734,9 @@ def clear_log():
 EXPORT_MARKER = "vnts-nas-export.json"
 
 # 导出包含：配置相关的小文件。明确排除：日志、核心二进制、pid、端口运行参数。
+# config.toml 是唯一的服务端配置文件（不再有 settings.json）。
 EXPORT_FILES = [
     ("config.toml", "server/config.toml"),
-    ("settings.json", "server/settings.json"),
     ("network_control.db", "server/network_control.db"),
     ("mirror", "server/mirror"),
     ("proxy", "server/proxy"),
@@ -760,7 +765,7 @@ def export_bundle():
             "format": 1,
             "created_at": now(),
             "core_version": installed_version(),
-            "note": "服务器配置导出：含 config.toml、settings.json、数据库与证书；不含日志与核心二进制。",
+            "note": "服务器配置导出：含 config.toml、数据库与证书；不含日志与核心二进制。",
             "includes": [],
         }
         for src_name, arc in EXPORT_FILES:
@@ -819,9 +824,13 @@ def import_bundle(data):
 
     restored = []
     try:
-        for base in [b for _, b in EXPORT_FILES][:1] + ["settings.json", "network_control.db",
-                    "mirror", "proxy"]:
-            arc = find(os.path.basename(base))
+        targets = ["config.toml", "network_control.db", "mirror", "proxy"]
+        # 老版本的导出包可能只带 settings.json、没有 config.toml：
+        # 先把它落盘，随后的渲染会把它并进 config.toml 并删除该文件。
+        if not find("config.toml"):
+            targets.append("settings.json")
+        for base in targets:
+            arc = find(base)
             if not arc:
                 continue
             safe = _safe_extract_member(arc)
@@ -844,13 +853,8 @@ def import_bundle(data):
                 pass
         return {"ok": False, "error": "写入失败，已回滚: %s" % e}
 
-    # settings 缺失则由 config.toml 反推，保证界面与文件一致
-    if "settings.json" not in restored and os.path.isfile(CONFIG_TOML):
-        try:
-            C.config_to_settings(SERVER_DIR)
-            restored.append("settings.json(由 config.toml 生成)")
-        except Exception:  # noqa: BLE001
-            pass
+    # 包内有 config.toml 就直接用它；只剩老 settings.json 的话，
+    # render_config() 内部的迁移会把设置并进 config.toml 并删除旧文件。
     render_config()
     return {"ok": True, "restored": restored, "backup": bool(backup)}
 

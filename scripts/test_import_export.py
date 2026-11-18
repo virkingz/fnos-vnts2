@@ -62,7 +62,8 @@ def main():
     names = z.namelist()
     check("含数据库", "server/network_control.db" in names, names)
     check("含 config.toml", "server/config.toml" in names)
-    check("含 settings.json", "server/settings.json" in names)
+    check("不含 settings.json（config.toml 为唯一配置文件）",
+          "server/settings.json" not in names, names)
     check("含证书", "server/cert.pem" in names)
     check("不含日志", not any(n.endswith(".log") for n in names), names)
     # 数据库内容完整

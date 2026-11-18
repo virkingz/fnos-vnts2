@@ -5,10 +5,14 @@
 import math
 import os
 import struct
+import sys
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "..", "app", "ui", "images")
+# 输出目录可用第一个参数覆盖：Docker 镜像里 /app 的目录布局与仓库不同，
+# 靠相对路径推不出来，必须显式指定。
+OUT = (os.path.abspath(sys.argv[1]) if len(sys.argv) > 1
+       else os.path.join(HERE, "..", "app", "ui", "images"))
 
 
 def draw(size):

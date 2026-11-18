@@ -290,8 +290,8 @@
     var msg = $('#settingsMsg');
     withBusy(function () {
       msg.textContent = '保存中…';
-      return api('/settings', { method: 'PUT', json: collectSettings() }).then(function (d) {
-        msg.textContent = '已保存' + (d.restarted ? '，核心已重启' : '');
+      return api('/settings', { method: 'PUT', json: collectSettings() }).then(function () {
+        msg.textContent = '已保存';
         toast('设置已保存', 'ok'); return loadState();
       }).catch(function (e) {
         msg.textContent = '';
@@ -330,7 +330,7 @@
         : '留空则用默认：' + d.default;
     });
     api('/state').then(function (st) {
-      var items = ['server/config.toml', 'server/settings.json',
+      var items = ['server/config.toml（唯一配置文件）',
         st.has_db ? 'server/network_control.db' : null, 'server/cert.pem / key.pem（若存在）']
         .filter(Boolean);
       $('#exportList').innerHTML = items.map(function (x) { return '✓ ' + x; }).join('<br>') +
@@ -541,7 +541,7 @@
     loadState().catch(function (e) { toast('加载状态失败：' + e.message, 'err'); });
     loadPorts();
     api('/settings').then(fillSettings).catch(function () {});
-    api('/mirror').catch(function () {});
+    // 镜像/代理现值统一从 /state 取（见下），无需再单独拉 /mirror、/proxy
     // 拉取镜像/代理现值
     api('/state').then(function (st) {
       $('#mirror').value = st.mirror || '';

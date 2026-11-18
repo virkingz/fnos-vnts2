@@ -34,8 +34,16 @@ WORKDIR /app
 
 COPY app/shell /app/shell
 COPY app/ui    /app/ui
+COPY scripts/gen_icons.py    /app/scripts/gen_icons.py
 COPY docker/entrypoint.sh    /app/docker/entrypoint.sh
 COPY docker/healthcheck.sh   /app/docker/healthcheck.sh
+
+# 图标是构建产物（.gitignore 忽略 app/ui/images/icon_*.png 与 app/shell/web/icon.png），
+# 仓库里根本没有这两组文件。fpk 由 pack.sh 现场生成，Docker 必须在此补上，
+# 否则管理页 logo 的 /icon.png 会 404（网页左上角图标空白）。
+# 纯标准库，alpine 无需额外依赖。
+RUN python3 /app/scripts/gen_icons.py /app/ui/images \
+    && cp -f /app/ui/images/icon_256.png /app/shell/web/icon.png
 
 RUN sed -i 's/\r$//' /app/docker/entrypoint.sh /app/docker/healthcheck.sh /app/shell/lib.sh \
     && chmod 755 /app/docker/entrypoint.sh /app/docker/healthcheck.sh /app/shell/lib.sh

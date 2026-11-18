@@ -284,11 +284,8 @@ class Handler(BaseHTTPRequestHandler):
                 res = P.update_settings(self._json_body())
                 if not res.get("ok"):
                     return self.err("；".join(res.get("errors", [])) or "保存失败")
-                restarted = False
-                if P.core_running():
-                    P.restart_core()
-                    restarted = True
-                return self.ok({"restarted": restarted})
+                # 不自动重启核心：只把 config.toml 写盘，何时生效由用户决定
+                return self.ok({"saved": True})
             return self.err("方法不允许", 405)
 
         if path == "/ports":
@@ -353,12 +350,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.err("方法不允许", 405)
 
         if path == "/mirror":
+            if method == "GET":
+                return self.ok({"mirror": P.get_mirror()})
             if method == "PUT":
                 P.set_mirror(self._json_body().get("mirror", ""))
                 return self.ok({"mirror": P.get_mirror()})
             return self.err("方法不允许", 405)
 
         if path == "/proxy":
+            if method == "GET":
+                return self.ok({"proxy": P.get_proxy()})
             if method == "PUT":
                 P.set_proxy(self._json_body().get("proxy", ""))
                 return self.ok({"proxy": P.get_proxy()})
@@ -676,6 +677,16 @@ class Handler(BaseHTTPRequestHandler):
             if full.endswith("index.html"):
                 return self._send(200, self._inject_base(data), "text/html; charset=utf-8")
             return self._send(200, data, mime_of(full))
+
+        # 图标是构建产物（见 .gitignore），fpk 由 pack.sh 现场生成。
+        # 若以「直接跑源码」的方式启动且没执行过 pack.sh，web/icon.png 并不存在，
+        # 这里退回 app/ui/images 里的同名生成物，避免 logo 404。
+        if rel == "icon.png":
+            alt = os.path.normpath(
+                os.path.join(WEB_DIR, "..", "..", "ui", "images", "icon_256.png"))
+            if os.path.isfile(alt):
+                with open(alt, "rb") as f:
+                    return self._send(200, f.read(), "image/png")
 
         # SPA 回退：未知路径交给管理页（index.html），并注入正确的 <base>。
         # 这样无论应用被挂在 / 还是 /app/vnts-nas（飞牛网关）都能自定位。
