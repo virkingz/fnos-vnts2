@@ -365,11 +365,14 @@ def render_log4rs(log_dir, level="info", max_mb=10, keep=5):
 # ---------------------------------------------------------------------------
 # 渲染全部
 # ---------------------------------------------------------------------------
-def render(server_dir, log_dir, ports_file=None, settings=None):
+def render(server_dir, log_dir, ports_file=None, settings=None, log_conf=None):
     """渲染 config.toml 与 logs/log4rs.yaml。
 
     settings 传入时用它（保存设置场景，避免「读—改—写」间的竞态）；
     否则从现有 config.toml 读。
+
+    log_conf 控制核心日志：{"level","max_mb","keep"}。不传则用默认
+    （info / 10MB / 5 份）—— 保持向后兼容，老调用方无需改动。
     """
     os.makedirs(server_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -384,13 +387,19 @@ def render(server_dir, log_dir, ports_file=None, settings=None):
 
     cfg_path = save_settings(server_dir, s, ports_file)
 
-    # logs/log4rs.yaml —— 让 vnts2 把日志写进独立 LOG_DIR
+    # logs/log4rs.yaml —— 让 vnts2 把日志写进独立 LOG_DIR。
+    # 级别/大小/份数由管理页配置（logconf.json），核心每 30 秒自动重读，
+    # 因此改完不必重启核心。
+    lc = log_conf or {}
     logs_dir = os.path.join(server_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
     l4 = os.path.join(logs_dir, "log4rs.yaml")
     tmp = l4 + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(render_log4rs(log_dir))
+        f.write(render_log4rs(log_dir,
+                              level=lc.get("level", "info"),
+                              max_mb=lc.get("max_mb", 10),
+                              keep=lc.get("keep", 5)))
     os.replace(tmp, l4)
 
     return cfg_path

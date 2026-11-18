@@ -62,7 +62,30 @@ vnts2 用 `SocketAddr` 解析 `peer_servers`，**只接受字面 `IP:端口`**�
 - 历史 `config.toml` 里残留的 `peer_servers` 会在启动时迁入 `dns-ip.json` 并清空配置。
 - 前提：互联记录存 SQLite，因此配了域名就必须开启「数据持久化」（保存时会校验）。
 
+### 新增：SOCKS5 代理与可配置日志
+
+- **支持 SOCKS5 代理**：`socks5://`（本地解析）与 `socks5h://`（远端 DNS）。
+  标准库的 urllib 不支持 SOCKS，因此以**纯标准库**实现（`app/shell/socks5.py`）：
+  起本地回环中转，把 urllib 的 `CONNECT` 转发进 SOCKS5 隧道，对上层透明。
+  零第三方依赖 —— 飞牛 NAS 上装包敏感，这条不能破。仅支持 SOCKS5，`socks4://` 明确拒绝。
+- **日志级别可配置**：`trace`/`debug`/`info`/`warn`/`error`，默认 `info`。
+  写进 `logs/log4rs.yaml`，该文件 `refresh_rate` 为 30 秒，**改完自动生效、无需重启核心** ——
+  临时开 debug 排查很顺手。
+- **日志轮转可配置**：单文件大小上限（默认 10 MB）与保留份数（默认 5），
+  两者一并接入「备份」页。
+
 ### 修复
+
+- **日志被面板截断，滚动配置形同虚设**：`vnts2.log` 原本也被面板在 512 KB 处
+  原地截断（保留 256 KB），把核心自己的 log4rs 滚动完全架空 ——
+  表现为「日志固定 512 KB、超过就覆盖，历史莫名消失」。
+  现在 `vnts2.log` 交给核心按 log4rs 滚动，面板不再碰它；
+  仅在核心未启用 log4rs（老版本）时才兜底截断。面板自身的日志照旧截断。
+- **客户端断开刷 traceback**：浏览器切路由、反代探活后立刻断开时，
+  `BaseHTTPRequestHandler` 读请求行会抛 `ConnectionResetError`，
+  `socketserver` 把整段 traceback 打到 stderr（进而进日志），把日志刷满。
+  现在读请求阶段的连接类异常（RST / 断管 / 超时）一律静默并关闭连接，
+  `handle_error` 也加了最后一道兜底；真正的故障仍照常记录。
 
 - **连不上的互联地址管不住**：核心控制台 `GET /api/peer_servers` 只返回**当前连上的**
   地址（内存列表只在认证成功后写入），而 `add`/`DELETE` 都是直接读写 SQLite。

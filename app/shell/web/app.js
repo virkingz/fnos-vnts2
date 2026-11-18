@@ -100,7 +100,7 @@
     });
     location.hash = name;
     if (name === 'logs') loadLog();
-    if (name === 'backup') refreshBackup();
+    if (name === 'backup') { refreshBackup(); loadLogConf(); }
     if (name === 'console') consoleEnter();
   }
   $$('.nav-item').forEach(function (a) {
@@ -519,6 +519,40 @@
       return api('/logdir', { method: 'PUT', json: { log_dir: $('#logDir').value.trim() } })
         .then(function (d) { toast('日志目录已设为 ' + d.log_dir, 'ok'); refreshBackup(); loadState(); })
         .catch(function (e) { toast(e.message, 'err'); });
+    });
+  });
+
+  // ---------------- vnts2 日志级别与轮转 ----------------
+  function loadLogConf() {
+    api('/logconf').then(function (c) {
+      $('#logLevel').value = c.level || 'info';
+      $('#logMaxMb').value = c.max_mb || 10;
+      $('#logKeep').value = c.keep || 5;
+      $('#logConfHint').textContent =
+        '修改后约 30 秒自动生效（核心每隔 30 秒重读配置），无需重启。' +
+        (c.core_running ? '' : ' 当前核心未运行，启动时即按此配置输出。');
+    }).catch(function (e) { toast(e.message, 'err'); });
+  }
+
+  $('#btnSaveLogConf').addEventListener('click', function () {
+    var msg = $('#logConfMsg');
+    withBusy(function () {
+      msg.textContent = '保存中…';
+      return api('/logconf', { method: 'PUT', json: {
+        level: $('#logLevel').value,
+        max_mb: $('#logMaxMb').value,
+        keep: $('#logKeep').value
+      } }).then(function (d) {
+        msg.textContent = '';
+        var c = d.conf;
+        $('#logLevel').value = c.level;
+        $('#logMaxMb').value = c.max_mb;
+        $('#logKeep').value = c.keep;
+        toast('日志设置已保存，约 30 秒内生效', 'ok');
+      }).catch(function (e) {
+        msg.textContent = '';
+        toast(e.message, 'err');
+      });
     });
   });
 

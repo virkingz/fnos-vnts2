@@ -251,6 +251,37 @@
         </div>
         <button class="btn" id="btnSaveLogDir">保存日志目录</button>
       </div>
+
+      <div class="panel">
+        <h2>vnts2 日志级别与轮转</h2>
+        <p class="muted">
+          <code>debug</code> 会输出大量连接细节，排查问题时才需要；平时用 <code>info</code>。
+          修改后约 30 秒内自动生效，<b>无需重启核心</b>。
+        </p>
+        <div class="field">
+          <label>日志级别</label>
+          <select id="logLevel" class="inp">
+            <option value="error">error（只记错误，最安静）</option>
+            <option value="warn">warn（错误 + 警告）</option>
+            <option value="info">info（推荐，默认）</option>
+            <option value="debug">debug（最详细，用于排查）</option>
+            <option value="trace">trace（极详细，慎用）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>单个日志文件大小上限（MB）</label>
+          <input type="number" id="logMaxMb" class="inp" placeholder="10" min="1" max="1024">
+        </div>
+        <div class="field">
+          <label>保留历史文件个数</label>
+          <input type="number" id="logKeep" class="inp" placeholder="5" min="1" max="100">
+        </div>
+        <div class="sticky-actions">
+          <button class="btn" id="btnSaveLogConf">保存日志设置</button>
+          <span class="muted" id="logConfMsg"></span>
+        </div>
+        <div class="hint" id="logConfHint"></div>
+      </div>
     </section>
 
     <!-- 控制台 -->

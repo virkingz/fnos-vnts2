@@ -14,6 +14,7 @@
   其 fetch('/api/…') 与页面同源，正好命中本服务的 /api 反代。
 """
 
+import errno
 import json
 import os
 import re
@@ -140,6 +141,34 @@ def json_bytes(obj):
 class Handler(BaseHTTPRequestHandler):
     server_version = "vnts-nas/1.0"
     protocol_version = "HTTP/1.1"
+
+    # -- 读请求阶段的连接异常 ----------------------------------------------
+    def handle_one_request(self):
+        """读请求行/请求头时的连接异常一律静默。
+
+        BaseHTTPRequestHandler.handle_one_request 里 `rfile.readline()` 抛出的
+        ConnectionResetError / BrokenPipeError / TimeoutError 会冒到
+        socketserver 的 handle_error，把整段 traceback 打到 stderr
+        （进程 stderr 又进了日志），日志被这类噪声刷满：
+
+            ConnectionResetError: [Errno 104] Connection reset by peer
+            File ".../http/server.py", line 408, in handle_one_request
+                self.raw_requestline = self.rfile.readline(65537)
+
+        这些都是**客户端侧的正常行为**，不是服务端故障：
+          - 浏览器切换路由/刷新时取消在途请求；
+          - 反代（飞牛网关、nginx）探测端口连通性后立刻断开；
+          - 长连接空闲超时后被对端关闭。
+
+        这里直接吞掉并标记关闭连接。真正需要排查的异常由 _route 的
+        except 分支记录（那才带请求路径等有用信息）。
+        """
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError,
+                TimeoutError, OSError):
+            # OSError 覆盖各平台不同的 errno（EPIPE/ECONNRESET/ETIMEDOUT…）
+            self.close_connection = True
 
     # -- 基础输出 ----------------------------------------------------------
     def _send(self, code, body=b"", ctype="application/json; charset=utf-8", extra=None):
@@ -347,6 +376,19 @@ class Handler(BaseHTTPRequestHandler):
                         return self.err("无法创建目录: %s" % e)
                 P.save_log_dir(d)
                 return self.ok({"log_dir": P.log_dir()})
+            return self.err("方法不允许", 405)
+
+        if path == "/logconf":
+            if method == "GET":
+                return self.ok(P.log_conf_view())
+            if method == "PUT":
+                b = self._json_body()
+                conf, errs = P.normalize_log_conf(
+                    b.get("level"), b.get("max_mb"), b.get("keep"))
+                if errs:
+                    return self.err("；".join(errs))
+                P.save_log_conf(conf)
+                return self.ok({"saved": True, "conf": P.log_conf_view()})
             return self.err("方法不允许", 405)
 
         if path == "/mirror":
@@ -779,6 +821,25 @@ class PanelHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     # 单连接读超时：防止慢客户端长期占线程
     timeout = 60
+
+    def handle_error(self, request, client_address):
+        """兜住残余的连接类异常，别把 traceback 打到 stderr。
+
+        socketserver 默认实现会把整段 traceback 写进 sys.stderr，
+        而本服务的 stderr 指向日志文件 —— 客户端正常断开就会刷满日志。
+        Handler.handle_one_request 已处理读阶段的异常，这里是最后一道防线
+        （例如 _send 之后连接才被重置、或 HEAD 探测中途断开）。
+        非连接类异常仍然照常打印，以免掩盖真实故障。
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError,
+                            ConnectionAbortedError, TimeoutError)):
+            return
+        # BrokenPipeError 在部分平台表现为普通 OSError，一并容错
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in (
+                errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED, errno.ETIMEDOUT):
+            return
+        ThreadingHTTPServer.handle_error(self, request, client_address)
 
 
 if HAVE_AF_UNIX:

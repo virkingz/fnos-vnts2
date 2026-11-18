@@ -207,8 +207,19 @@ appcenter-cli install-fpk fnos-vnts2.fpk
 - `server/logs/` 里只有一份几百字节的 `log4rs.yaml`（配置，随导出带走）
 - 想把日志挪到别的盘，改「配置导入导出 → 日志目录」即可，立即生效
 
-日志单个超过 **512 KB** 自动原地截断（保留最近 256 KB）。用「原地截断」而非「改名轮转」，
-是因为 vnts2 以追加方式持有文件句柄，改名会让它继续写旧 inode。
+**两套日志由不同角色管理，别混淆**：
+
+| 日志 | 归属 | 策略 |
+|---|---|---|
+| `vnts2.log` | 核心（log4rs） | 按管理页配置滚动，默认 10 MB × 5 份，**面板不截断** |
+| `main.log` / `shell.log` / `update.log` | 面板自身 | 超过 512 KB 原地截断，保留最近 256 KB |
+
+`vnts2.log` 的截断必须交给核心 —— 面板的截断是「原地丢弃前半段」，
+若也作用在 `vnts2.log` 上，会把 log4rs 的滚动配置完全架空，用户永远只能看到
+最近一小段日志、历史莫名消失。核心未启用 log4rs 时（老版本核心）面板才兜底截断。
+
+> 面板自身的日志用「原地截断」而非「改名轮转」，是因为 vnts2 以追加方式持有文件句柄，
+> 改名会让它继续写旧 inode。
 
 ## 核心更新
 
@@ -287,21 +298,51 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 | 配置 | 作用层 | 写法 | 说明 |
 |------|--------|------|------|
 | **镜像前缀** | URL 层 | `https://ghproxy.example.com`（**不带端口**） | 请求会拼成 `前缀/https://github.com/...` |
-| **网络代理** | 网络层 | `http://127.0.0.1:7890`（**必须带端口**） | 让请求经 HTTP 代理隧道出去 |
+| **网络代理** | 网络层 | `http://127.0.0.1:7890`（**必须带端口**） | 让请求经代理隧道出去 |
 
 **两者别填错栏**：不带端口的是加速前缀，带端口的才是代理。填错会被拦下并提示改填 ——
 把前缀当代理用会一直超时，且之后所有下载都失败。
 
-- 代理仅支持 **HTTP/HTTPS**：管理页走的是 Python 标准库，不支持 SOCKS，
-  填 `socks5h://` 会被明确拒绝（不会静默失败）。请填 Clash 等工具的 HTTP 端口。
+代理支持 **HTTP / HTTPS / SOCKS5**：
+
+| 写法 | 域名解析位置 | 适用 |
+|------|-------------|------|
+| `http://host:port` | 本地 | Clash 等工具的 HTTP 端口 |
+| `socks5://host:port` | 本地 | 先本地解析成 IP 再交给代理 |
+| `socks5h://host:port` | **代理侧**（远端 DNS） | 需要代理才能解析域名时用它 |
+
+- SOCKS 由本项目以**纯标准库**实现（`app/shell/socks5.py`），不引入任何第三方依赖。
+  做法是起一个本地回环中转端口，把 urllib 的 `CONNECT` 转发进 SOCKS5 隧道，
+  对上层完全透明。仅支持 SOCKS5，`socks4://` 会被明确拒绝。
 - 代理**保存前先实测**，连不通则不保存，原有设置不变；历史误配会在启动时自动纠正
   （把代理栏里的加速前缀挪到镜像栏）。
 - 下载核心时按 `配置路径 → 镜像直连 → GitHub 直连` 依次回退，一次误配不会把更新锁死。
 - 点「测试连通性」会**分项**报告：直连 / 镜像前缀 / 网络代理 / 实际下载路径，
   每项带耗时与原因（超时、拒绝、解析失败、限流、需要认证）。
 
-> Docker 的 `PROXY` 环境变量与 fpk 升级回调走 `curl`，那条路径支持 `socks5h://`；
-> 但为了两边一致，建议统一用一个 HTTP 代理（如 Clash 的 `http://<host>:7890`）。
+> **关于 `no_proxy`**：若环境变量里设了 `no_proxy`（例如含 `127.0.0.1`），
+> 访问这些主机时 urllib 会按惯例直连、绕过代理。面板访问的是 `github.com`
+> 这类外部域名，不受影响；只有你把目标设成本机地址时才会遇到。
+
+> Docker 的 `PROXY` 环境变量与 fpk 升级回调走 `curl`，那条路径原生支持 `socks5h://`。
+
+## 日志级别与轮转
+
+「备份」页可调 vnts2 自身的日志策略：
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| 日志级别 | `info` | `trace` / `debug` / `info` / `warn` / `error` |
+| 单文件上限 | 10 MB | 超过即滚动 |
+| 保留份数 | 5 | 滚动后保留的历史文件数 |
+
+- 配置写进 `server/logs/log4rs.yaml`，由 vnts2 自己读取。该文件里
+  `refresh_rate: 30 seconds`，所以**改完约 30 秒自动生效，无需重启核心** ——
+  临时开 `debug` 排查问题很方便。
+- `debug` 会输出大量连接细节（连接/断开、重试、路由），排查完记得调回 `info`。
+- 面板自身的日志（`main.log` / `shell.log` / `update.log`）超过 512 KB 自动截断到 256 KB；
+  **`vnts2.log` 不由面板截断**，交给核心按上面的策略滚动 —— 否则会把滚动配置架空，
+  导致你只能看到"最近一小段"日志。
 
 ## 打包与测试
 
@@ -309,13 +350,14 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 bash scripts/pack.sh            # 产出 fnos-vnts2.fpk
 bash scripts/pack.sh 1.0.1      # 指定版本
 
-python scripts/test_e2e.py            # 端到端（46 项）
-python scripts/test_import_export.py  # 导入导出专项（21 项）
+python scripts/test_e2e.py            # 端到端（59 项）
+python scripts/test_import_export.py  # 导入导出专项（28 项）
 python scripts/test_console.py        # 控制台反代与控制台联动（41 项）
 python scripts/test_console_real.py   # 真实前端结构全链路（24 项，素材取自 vnts 二进制）
 python scripts/test_concurrency.py    # 并发与连接复用（8 项）
-python scripts/test_netconf.py        # 下载源与代理：校验/自愈/回退/导出格式（43 项）
-python scripts/test_dnspeers.py       # 出站互联域名同步：先加后删/自愈/IPv6/401 重登（103 项）
+python scripts/test_netconf.py        # 下载源与代理：校验/自愈/回退/导出格式（46 项）
+python scripts/test_dnspeers.py       # 出站互联域名同步：先加后删/自愈/IPv6/401 重登（158 项）
+python scripts/test_socks_log.py      # SOCKS5 协议与中继、日志级别轮转、RST 静默（59 项）
 node   scripts/probe_vite_url.js      # Vite 资源路径改写校验（0 错误）
 ```
 

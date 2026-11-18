@@ -31,6 +31,7 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import dns_peers as DP  # noqa: E402
+import socks5 as SOCKS  # noqa: E402
 import vnts_config as C  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,8 @@ SERVER_DIR = os.path.join(PKGVAR, "server")
 CACHE_DIR = os.path.join(PKGVAR, "cache")
 PORT_FILE = os.path.join(PKGVAR, "ports.env")
 LOGDIR_FILE = os.path.join(PKGVAR, "logdir")
+# 核心日志级别与轮转设置（级别 / 单文件 MB / 保留份数）
+LOG_CONF_FILE = os.path.join(PKGVAR, "logconf.json")
 MIRROR_FILE = os.path.join(SERVER_DIR, "mirror")
 PROXY_FILE = os.path.join(SERVER_DIR, "proxy")
 # 出站互联域名清单 + 解析结果（与 mirror/proxy 同级，导出包自动带上）
@@ -118,6 +121,97 @@ def save_log_dir(d):
             f.write(d)
     # 同步更新 log4rs.yaml，让 vnts2 立刻写到新目录
     render_config()
+
+
+# ---------------------------------------------------------------------------
+# 核心日志级别与轮转（写进 logs/log4rs.yaml，由 vnts2 自己读取）
+#
+# vnts2 用 log4rs::init_file() 读 CWD/logs/log4rs.yaml，其 root.level 决定
+# 输出哪些日志。yaml 里 refresh_rate 为 30 秒，所以改完约 30 秒自动生效，
+# **不需要重启核心** —— 这点对「临时开 debug 排查」很关键。
+# ---------------------------------------------------------------------------
+LOG_LEVELS = ("trace", "debug", "info", "warn", "error")
+LOG_MAX_MB_MIN, LOG_MAX_MB_MAX = 1, 1024
+LOG_KEEP_MIN, LOG_KEEP_MAX = 1, 100
+
+
+def load_log_conf():
+    """读日志配置。缺失或损坏时回到默认（info / 10MB / 5 份）。"""
+    conf = {"level": "info", "max_mb": 10, "keep": 5}
+    raw = read_file(LOG_CONF_FILE).strip()
+    if not raw:
+        return conf
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return conf
+    if not isinstance(data, dict):
+        return conf
+    lv = str(data.get("level") or "").lower()
+    if lv in LOG_LEVELS:
+        conf["level"] = lv
+    for key, lo, hi in (("max_mb", LOG_MAX_MB_MIN, LOG_MAX_MB_MAX),
+                        ("keep", LOG_KEEP_MIN, LOG_KEEP_MAX)):
+        try:
+            n = int(data.get(key))
+        except (TypeError, ValueError):
+            continue
+        if lo <= n <= hi:
+            conf[key] = n
+    return conf
+
+
+def normalize_log_conf(level, max_mb, keep):
+    """校验日志配置。返回 (配置, 错误列表)。只校验传进来的字段。"""
+    conf = load_log_conf()
+    errs = []
+    if level is not None:
+        lv = str(level).strip().lower()
+        if lv not in LOG_LEVELS:
+            errs.append("日志级别只支持 %s" % " / ".join(LOG_LEVELS))
+        else:
+            conf["level"] = lv
+    if max_mb is not None:
+        try:
+            n = int(max_mb)
+        except (TypeError, ValueError):
+            errs.append("文件大小上限需为整数（MB）")
+        else:
+            if not (LOG_MAX_MB_MIN <= n <= LOG_MAX_MB_MAX):
+                errs.append("文件大小上限需在 %d-%d MB 之间" % (LOG_MAX_MB_MIN, LOG_MAX_MB_MAX))
+            else:
+                conf["max_mb"] = n
+    if keep is not None:
+        try:
+            n = int(keep)
+        except (TypeError, ValueError):
+            errs.append("保留份数需为整数")
+        else:
+            if not (LOG_KEEP_MIN <= n <= LOG_KEEP_MAX):
+                errs.append("保留份数需在 %d-%d 之间" % (LOG_KEEP_MIN, LOG_KEEP_MAX))
+            else:
+                conf["keep"] = n
+    return conf, errs
+
+
+def save_log_conf(conf):
+    """保存日志配置并立刻重渲染 log4rs.yaml。
+
+    refresh_rate 为 30 秒，核心会自动重读，无需重启。
+    """
+    write_file(LOG_CONF_FILE, json.dumps(conf, ensure_ascii=False, indent=2) + "\n")
+    render_config()
+    return conf
+
+
+def log_conf_view():
+    conf = load_log_conf()
+    conf["levels"] = list(LOG_LEVELS)
+    conf["max_mb_range"] = [LOG_MAX_MB_MIN, LOG_MAX_MB_MAX]
+    conf["keep_range"] = [LOG_KEEP_MIN, LOG_KEEP_MAX]
+    # 核心是否在跑，决定「改完是否立即生效」的提示
+    conf["core_running"] = bool(core_running())
+    return conf
 
 
 def main_log():
@@ -463,11 +557,19 @@ def normalize_proxy(p):
         return "", "代理地址格式无效：%s" % p
 
     if scheme in _SOCKS_SCHEMES:
-        # urllib 只支持 http(s) 代理，socks 填了必然失败，不如直接说清楚
-        return "", ("面板不支持 socks 代理（Python 标准库无此能力）。"
-                    "请填 HTTP 代理地址，例如 Clash 的 http://127.0.0.1:7890")
+        # SOCKS5 由本项目的 socks5.py 以纯标准库实现（起本地中转端口，
+        # 把 urllib 的 CONNECT 转发进 SOCKS5 隧道）。仅支持 SOCKS5；
+        # SOCKS4 协议更老且缺少域名支持，不实现。
+        if scheme not in ("socks5", "socks5h"):
+            return "", ("只支持 SOCKS5 代理（socks5:// 或 socks5h://）。"
+                        "SOCKS4 不支持，请改用 socks5://")
+        if not host:
+            return "", "代理地址缺少主机名"
+        if not port:
+            return "", "代理地址缺少端口，例如 socks5://127.0.0.1:7891"
+        return "%s://%s:%d" % (scheme, host, port), ""
     if scheme not in ("http", "https"):
-        return "", "代理地址只支持 http:// 或 https:// 开头"
+        return "", ("代理地址只支持 http:// 、https:// 或 socks5:// 开头")
     if not host:
         return "", "代理地址缺少主机名"
     if not port:
@@ -571,12 +673,61 @@ def url_with_mirror(u):
     return "%s/%s" % (m, u) if m else u
 
 
+def _is_socks(proxy):
+    """判断代理串是否为 SOCKS5。"""
+    return str(proxy or "").lower().startswith("socks5")
+
+
+def _socks_relay(proxy):
+    """为 SOCKS5 代理起一个本地中转，返回 (中转代理地址, 服务器对象)。
+
+    调用方必须在用完（或异常）时调 server.stop()，否则监听端口会泄漏。
+    socks5h 走远端 DNS，域名原样交给代理解析 —— 这与 Clash 等工具的惯例一致，
+    也是内网域名经代理访问时唯一可行的方式。
+    """
+    u = urllib.parse.urlsplit(proxy)
+    remote_dns = u.scheme.lower() == "socks5h"
+    srv = SOCKS.SocksRelayServer(u.hostname, u.port, remote_dns=remote_dns,
+                                 timeout=30)
+    port = srv.start()
+    return "http://127.0.0.1:%d" % port, srv
+
+
+class _SocksResponse(object):
+    """把 (response, relay) 包一层，让 close() 时顺带关掉中转服务器。
+
+    不这样做的话，每次请求都会留下一个监听端口和线程，长时间运行会累积。
+    """
+
+    def __init__(self, resp, relay):
+        self._resp = resp
+        self._relay = relay
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self._resp.close()
+        finally:
+            if self._relay is not None:
+                self._relay.stop()
+                self._relay = None
+
+
 def _open(url, timeout=30, proxy=None, method="GET"):
     """打开 URL。
 
     proxy=None  -> 使用配置里的代理（若有）
     proxy=""    -> 强制直连，同时禁用系统环境变量里的 http_proxy
-    proxy="x://host:port" -> 用指定代理
+    proxy="x://host:port" -> 用指定代理（http/https/socks5/socks5h）
     """
     headers = {
         "User-Agent": "vnts-nas-fpk",
@@ -585,6 +736,20 @@ def _open(url, timeout=30, proxy=None, method="GET"):
     req = urllib.request.Request(url, method=method, headers=headers)
     if proxy is None:
         proxy = get_proxy()
+
+    if proxy and _is_socks(proxy):
+        # SOCKS5：起本地中转，让 urllib 以为在用普通 http 代理
+        local, relay = _socks_relay(proxy)
+        try:
+            op = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": local, "https": local})
+            )
+            resp = op.open(req, timeout=timeout)
+        except Exception:
+            relay.stop()
+            raise
+        return _SocksResponse(resp, relay)
+
     if proxy:
         op = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
@@ -601,6 +766,17 @@ def _proxy_opener():
     proxy = get_proxy()
 
     def _opener(req, timeout=30):
+        if proxy and _is_socks(proxy):
+            local, relay = _socks_relay(proxy)
+            try:
+                op = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": local, "https": local})
+                )
+                resp = op.open(req, timeout=timeout)
+            except Exception:
+                relay.stop()
+                raise
+            return _SocksResponse(resp, relay)
         if proxy:
             op = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy})
@@ -664,7 +840,7 @@ def get_console_username():
 def render_config():
     """渲染 config.toml 与 logs/log4rs.yaml。"""
     ensure_dirs()
-    return C.render(SERVER_DIR, log_dir(), PORT_FILE)
+    return C.render(SERVER_DIR, log_dir(), PORT_FILE, log_conf=load_log_conf())
 
 
 def get_settings():
@@ -1171,8 +1347,27 @@ def trim_one(path):
 
 
 def trim_logs():
-    for n in ("main.log", "shell.log", "vnts2.log", "update.log"):
+    """截断**面板自己**的日志，避免无限增长。
+
+    ⚠ vnts2.log **不在这里截断**。
+    核心日志由它自己的 log4rs 按大小滚动（默认 10MB × 5 份，可在管理页调整）。
+    此前这里也截断 vnts2.log，512KB 就砍到 256KB —— 那会把核心的滚动配置
+    完全架空，用户看到的永远是「最近 256KB」，历史日志莫名消失。
+    只有核心未启用 log4rs（老版本核心或 yaml 缺失）时才兜底截断它。
+    """
+    for n in ("main.log", "shell.log", "update.log"):
         trim_one(os.path.join(log_dir(), n))
+    if not _core_log4rs_active():
+        trim_one(os.path.join(log_dir(), "vnts2.log"))
+
+
+def _core_log4rs_active():
+    """核心是否在用我们写的 log4rs.yaml（决定 vnts2.log 归谁管）。"""
+    l4 = os.path.join(SERVER_DIR, "logs", "log4rs.yaml")
+    if not os.path.isfile(l4):
+        return False
+    # 我们渲染的 yaml 一定含 rolling_file 段落
+    return "rolling_file" in read_file(l4)
 
 
 def _tail(path, n=100):

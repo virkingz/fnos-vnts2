@@ -241,11 +241,42 @@ def main():
         st = json.loads(b.decode())["data"]["status"]
         check("再次清空后状态一致", st["count"] == 0 and st["managed"] == [], st)
 
-        print("\n[10] 控制台反代（核心未运行）")
+        print("\n[10] vnts2 日志级别与轮转接口")
+        c, b = get(url + "/panel-api/logconf", {"X-Panel-Token": token})
+        lc = json.loads(b.decode())["data"]
+        check("GET 返回日志配置", lc["level"] == "info" and lc["max_mb"] == 10,
+              {k: lc[k] for k in ("level", "max_mb", "keep")})
+        check("返回可选级别列表", "debug" in lc["levels"], lc.get("levels"))
+
+        c, b = get(url + "/panel-api/logconf",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"level": "verbose"}).encode())
+        check("非法级别被拒", c == 400 and "级别" in b.decode("utf-8", "replace"), b[:120])
+
+        c, b = get(url + "/panel-api/logconf",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"max_mb": 0}).encode())
+        check("越界大小被拒", c == 400, b[:120])
+
+        c, b = get(url + "/panel-api/logconf",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"level": "debug", "max_mb": 32, "keep": 7}).encode())
+        check("合法配置保存成功", c == 200, b[:160])
+        l4 = open(os.path.join(var, "server", "logs", "log4rs.yaml"),
+                  encoding="utf-8").read()
+        check("log4rs.yaml 的 level 已更新", "level: debug" in l4)
+        check("log4rs.yaml 的轮转大小已更新", "limit: 32 mb" in l4)
+        check("log4rs.yaml 的保留份数已更新", "count: 7" in l4)
+
+        c, b = get(url + "/panel-api/logconf", {"X-Panel-Token": token})
+        check("回读为保存后的值",
+              json.loads(b.decode())["data"]["max_mb"] == 32, b[:160])
+
+        print("\n[11] 控制台反代（核心未运行）")
         c, b = get(url + "/console/")
         check("未运行时返回提示", c == 502 and ("控制台未运行" in b.decode("utf-8", "replace")), c)
 
-        print("\n[11] 自检")
+        print("\n[12] 自检")
 
         c, b = get(url + "/panel-api/selfcheck", {"X-Panel-Token": token})
         check("自检可调用", c == 200, c)

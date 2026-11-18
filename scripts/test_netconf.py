@@ -6,7 +6,9 @@
   1. 把「加速前缀」（https://ghproxy.example.com，不带端口）填进**代理**栏
      —— urllib 会向它发 CONNECT 而无人应答，表现为「测试连通性超时」，
         之后所有下载都失败。必须拦下来并指向镜像前缀。
-  2. socks 代理：Python 标准库不支持，填了必然失败，应直接说清楚。
+  2. **socks5 代理**：Python 标准库不支持，本项目以纯标准库实现（见
+     socks5.py：本地中转 + SOCKS5 CONNECT 隧道）。socks5:// 本地解析域名，
+     socks5h:// 把域名交给代理解析（远端 DNS）。仅支持 SOCKS5，SOCKS4 仍拒绝。
   3. 误配已落盘（历史配置）：启动时自愈，把前缀挪到镜像栏，别让用户困在里面。
 
 另外验证「下载核心」的回退链：配置路径失败后会依次试 镜像直连、GitHub 直连，
@@ -69,7 +71,10 @@ def main():
         ("https://ghproxy.example.com", False),   # 加速前缀，不是代理 ★
         ("ghproxy.example.com", False),           # 无端口
         ("127.0.0.1", False),                     # 忘了端口
-        ("socks5h://127.0.0.1:1080", False),      # stdlib 不支持 socks ★
+        ("socks5://127.0.0.1:7891", True),        # 本项目自带 SOCKS5 实现
+        ("socks5h://127.0.0.1:1080", True),       # 远端 DNS 语义
+        ("socks4://127.0.0.1:1080", False),       # 只实现 SOCKS5
+        ("socks5://127.0.0.1", False),            # 缺端口
         ("ftp://1.2.3.4:21", False),
     ]:
         addr, err = S.normalize_proxy(raw)
