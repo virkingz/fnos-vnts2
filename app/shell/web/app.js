@@ -351,7 +351,15 @@
   function renderPeers(st) {
     var box = $('#dnsPeersStatus');
     if (!st || !st.records || !st.records.length) {
-      box.innerHTML = '<p>未配置出站互联域名（不轮询）。</p>';
+      // 清单已清空，但可能还有我们加过的地址待撤下
+      if (st && st.pending_cleanup) {
+        box.innerHTML = '<p class="muted">清单已清空，正在撤下托管地址：' +
+          (st.managed || []).map(function (a) {
+            return '<span class="mono">' + esc(a) + '</span>';
+          }).join('、') + '</p>';
+      } else {
+        box.innerHTML = '<p>未配置出站互联域名（不轮询）。</p>';
+      }
       return;
     }
     var rows = st.records.map(function (r) {

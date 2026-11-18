@@ -174,7 +174,7 @@ def resolve_first(host, timeout=5, _getaddrinfo=None):
 # dns-ip.json 读写
 # ---------------------------------------------------------------------------
 def default_doc():
-    return {"version": 1, "interval": DEFAULT_INTERVAL, "records": []}
+    return {"version": 1, "interval": DEFAULT_INTERVAL, "records": [], "managed": []}
 
 
 def new_record(host, port):
@@ -239,6 +239,15 @@ def load_doc(path):
                     rec[k] = 0
             out.append(rec)
         doc["records"] = out
+    # managed：曾经由我们写进核心的出站地址集合。
+    #
+    # 这是「清单被清空后仍能精确清理」的依据 —— 清空 records 会丢失
+    # 「哪些地址归我们管」的信息，若只靠 records 推断，就只能退化成
+    # 「删除所有出站地址」，那会误伤用户在控制台手工添加的互联。
+    # 有了它，从有到无时也能只删自己加过的那几条。
+    mgd = raw.get("managed")
+    if isinstance(mgd, list):
+        doc["managed"] = [str(x).strip() for x in mgd if str(x).strip()]
     return doc
 
 
@@ -492,6 +501,10 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
       阶段二（清理残留）：删除出站列表里所有不属于清单的地址。
         放在最后是为了不误删「本轮刚加的新地址还没确认就清理」。
 
+    **清单为空 = 撤下全部托管地址**（从有到无）：
+    不再早退，而是删除 doc["managed"] 里记录的、我们曾加进去的地址。
+    不能删「所有出站地址」—— 那会误伤用户在控制台手工添加的互联。
+
     安全约束：只处理 outbound（核心主动外连的）地址，绝不碰 inbound
     （别的服务端连进来的），那些不是我们的管辖范围。
     """
@@ -503,8 +516,7 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
             log(msg)
 
     records = records_of(doc)
-    if not records:
-        return actions
+    managed = [str(x).strip() for x in (doc.get("managed") or []) if str(x).strip()]
 
     out_addrs, all_addrs, err = client.list_peers()
     if err:
@@ -512,6 +524,27 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
             rec["last_error"] = err
             actions.append({"host": rec.get("host"), "action": "error",
                             "addr": "", "msg": err})
+        return actions
+
+    # ---- 清单为空：撤下所有托管地址（从有到无的关键路径）----
+    if not records:
+        for addr in managed:
+            if addr not in out_addrs:
+                continue
+            ok, derr = client.del_peer(addr)
+            if ok:
+                out_addrs.remove(addr)
+                actions.append({"host": "", "action": "del", "addr": addr,
+                                "msg": "清单已清空，撤下托管地址"})
+                _log("清单已清空，撤下托管地址：%s" % addr)
+            else:
+                actions.append({"host": "", "action": "error", "addr": addr,
+                                "msg": derr})
+                _log("撤下托管地址 %s 失败：%s" % (addr, derr))
+        # 全部撤下成功才清空 managed；有失败则保留，下轮继续重试
+        failed = [a for a in actions if a.get("action") == "error"]
+        doc["managed"] = [] if not failed else managed
+        doc["records"] = []
         return actions
 
     # 清单要求的目标地址集合。
@@ -566,6 +599,7 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
             # 地址未变、且确实在列表里 → 无需任何写操作
             rec["last_error"] = ""
             rec["last_sync"] = now
+            rec["last_ok"] = now
             actions.append({"host": host, "action": "keep", "addr": want, "msg": ""})
             continue
 
@@ -616,6 +650,18 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
                             "msg": derr})
             _log("清理多余地址 %s 失败：%s" % (addr, derr))
 
+    # 重建 managed：清单要求的目标地址，加上仍受保护的历史托管地址
+    # （解析失败的条目、以及删除失败待重试的残留）。
+    # 这样「从有到无」时能凭它精确撤下我们加过的地址。
+    keep_managed = set(wanted)
+    keep_managed.update(protected)
+    if not actions or all(a.get("action") != "error" for a in actions):
+        # 本轮无异常 → 托管集合就是清单目标，丢掉一切历史痕迹
+        doc["managed"] = sorted(wanted)
+    else:
+        # 有失败项 → 保留其地址，下一轮继续重试
+        doc["managed"] = sorted(keep_managed)
+
     return actions
 
 
@@ -633,11 +679,16 @@ def status_view(doc):
             "last_ok": r.get("last_ok", 0),
             "last_error": r.get("last_error", ""),
         })
+    managed = [str(x).strip() for x in (doc.get("managed") or []) if str(x).strip()]
     return {
         "interval": doc.get("interval", DEFAULT_INTERVAL),
         "records": items,
         "count": len(items),
-        "enabled": bool(items),
+        # enabled 表示「是否在托管中」：还有清单、或还有待撤下的托管地址。
+        # 界面据它判断要不要提示「正在撤下残留」。
+        "enabled": bool(items) or bool(managed),
+        "managed": managed,
+        "pending_cleanup": bool(managed) and not items,
     }
 
 

@@ -217,11 +217,29 @@ def main():
               c == 200 and j["data"]["ok"] is False, b[:160])
 
         # 清空清单 → 恢复「不轮询」状态
+        # 注意：本用例里核心始终未运行，地址从未真正加进核心，因此 managed
+        # 为空、pending_cleanup 为假 —— 这正是「没连上就没什么可撤」的正确表现。
         c, b = get(url + "/panel-api/dns-peers",
                    {"X-Panel-Token": token, "Content-Type": "application/json"},
                    "PUT", json.dumps({"peers": ""}).encode())
         st = json.loads(b.decode())["data"]["status"]
-        check("清空后 enabled 为假", st["count"] == 0 and st["enabled"] is False)
+        check("清空后无域名记录", st["count"] == 0, st)
+        check("清空后 enabled 为假（无待撤地址）",
+              st["enabled"] is False and st["pending_cleanup"] is False, st)
+        check("清空后 managed 为空", st["managed"] == [], st)
+
+        # 重新只填一条 → 再清空，managed 仍应保持干净（核心没运行过）
+        c, b = get(url + "/panel-api/dns-peers",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"peers": "peer1.example.com:29873"}).encode())
+        st = json.loads(b.decode())["data"]["status"]
+        check("重新只填一条后清单为 1", st["count"] == 1, st)
+
+        c, b = get(url + "/panel-api/dns-peers",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"peers": ""}).encode())
+        st = json.loads(b.decode())["data"]["status"]
+        check("再次清空后状态一致", st["count"] == 0 and st["managed"] == [], st)
 
         print("\n[10] 控制台反代（核心未运行）")
         c, b = get(url + "/console/")

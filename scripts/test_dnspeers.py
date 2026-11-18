@@ -405,7 +405,100 @@ s["persistence"] = False
 check("无域名时允许关持久化", not any("持久化" in e for e in C.validate(s)))
 
 # ===========================================================================
-print("\n[20] 控制台客户端：登录 / 401 重登 / 地址转义")
+print("\n[20] 从有到无：清空清单必须撤下已连接的地址")
+# ===========================================================================
+# 这是本轮修的 bug：清单从有变无时，之前加过的地址没人删，一直连着。
+# 关键是要能区分「我们加过的」与「用户手工加的」—— 靠 doc["managed"]。
+
+# 场景：清单清空，managed 里记着我们加过的地址 → 必须撤下
+d = {"records": [], "managed": ["1.2.3.4:29873"]}
+c = StubClient(["1.2.3.4:29873"])
+acts = D.sync_once(d, c, _getaddrinfo=gai_map({}))
+check("清空后撤下了托管地址", c.calls == [("del", "1.2.3.4:29873")], c.calls)
+check("核心列表已清空", c.addrs == [], c.addrs)
+check("动作标记为 del",
+      any(a["action"] == "del" and a["addr"] == "1.2.3.4:29873" for a in acts), acts)
+check("撤下后 managed 归空", d["managed"] == [], d["managed"])
+
+# 场景：清空清单时必须保留用户手工加的地址
+d = {"records": [], "managed": ["1.2.3.4:29873"]}
+c = StubClient(["1.2.3.4:29873", "8.8.8.8:9999"])   # 后者是用户手工加的
+D.sync_once(d, c, _getaddrinfo=gai_map({}))
+check("只撤下托管的，手工加的不动", c.addrs == ["8.8.8.8:9999"], c.addrs)
+
+# 场景：托管地址有多个，全部撤下
+d = {"records": [], "managed": ["1.2.3.4:1", "5.6.7.8:2"]}
+c = StubClient(["1.2.3.4:1", "5.6.7.8:2"])
+D.sync_once(d, c, _getaddrinfo=gai_map({}))
+check("多个托管地址全部撤下", c.addrs == [], c.addrs)
+check("managed 清空", d["managed"] == [])
+
+# 场景：托管地址已不在核心列表里（早被手工删过）→ 不报错，直接认账
+d = {"records": [], "managed": ["1.2.3.4:29873"]}
+c = StubClient([])
+acts = D.sync_once(d, c, _getaddrinfo=gai_map({}))
+check("已不存在的托管地址不产生调用", c.calls == [], c.calls)
+check("managed 照样归空", d["managed"] == [])
+check("不产生错误动作", [a for a in acts if a["action"] == "error"] == [])
+
+# 场景：撤下失败 → managed 保留，下轮继续重试（不能丢）
+d = {"records": [], "managed": ["1.2.3.4:29873"]}
+c = StubClient(["1.2.3.4:29873"], fail_del=True)
+acts = D.sync_once(d, c, _getaddrinfo=gai_map({}))
+check("删除失败时 managed 保留待重试", d["managed"] == ["1.2.3.4:29873"], d["managed"])
+check("失败被记为 error", any(a["action"] == "error" for a in acts), acts)
+d2 = {"records": [], "managed": ["1.2.3.4:29873"]}
+c2 = StubClient(["1.2.3.4:29873"])
+D.sync_once(d2, c2, _getaddrinfo=gai_map({}))
+check("下一轮重试成功", c2.addrs == [] and d2["managed"] == [])
+
+# 场景：曾托管、但核心未运行 → 不该误清 managed（下轮核心起来再撤）
+check("空清单 + 空 managed 才算真正的 skipped",
+      D.status_view({"records": [], "managed": []})["enabled"] is False)
+check("空清单但有 managed → enabled 为真",
+      D.status_view({"records": [], "managed": ["1.2.3.4:1"]})["enabled"] is True)
+st = D.status_view({"records": [], "managed": ["1.2.3.4:1"]})
+check("标记为待清理", st["pending_cleanup"] is True and st["managed"] == ["1.2.3.4:1"])
+
+# 场景：正常同步时 managed 应记录当前目标地址
+d = {"records": [rec(cur="")], "managed": []}
+c = StubClient([])
+D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
+check("同步后 managed 记录目标地址", d["managed"] == ["1.2.3.4:29873"], d["managed"])
+
+# 场景：IP 变化后 managed 应只剩新地址（旧的不再托管）
+d = {"records": [rec(cur="9.9.9.9:29873")], "managed": ["9.9.9.9:29873"]}
+c = StubClient(["9.9.9.9:29873"])
+D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
+check("managed 只剩新地址", d["managed"] == ["1.2.3.4:29873"], d["managed"])
+
+# 场景：managed 往返持久化
+p2 = os.path.join(tmp, "dns-mgd.json")
+D.save_doc(p2, {"version": 1, "interval": 60, "records": [], "managed": ["1.2.3.4:1"]})
+check("managed 可持久化并读回", D.load_doc(p2)["managed"] == ["1.2.3.4:1"])
+check("旧文件无 managed 时回默认空列表",
+      D.load_doc(os.path.join(tmp, "nope2.json"))["managed"] == [])
+
+print("\n[21] 文档层：managed 的持久化与合并")
+# ===========================================================================
+# managed 是「从有到无」能生效的唯一依据，必须保证它不被各条写入路径弄丢。
+p3 = os.path.join(tmp, "dns-mgd2.json")
+D.save_doc(p3, {"version": 1, "interval": 60, "records": [], "managed": ["1.2.3.4:1"]})
+doc = D.load_doc(p3)
+check("managed 往返持久化", doc["managed"] == ["1.2.3.4:1"], doc)
+check("records 为空但 managed 非空时状态正确",
+      D.status_view(doc)["pending_cleanup"] is True)
+
+# 老版本文件（无 managed 键）应回默认空列表，不报错
+with open(p3, "w", encoding="utf-8") as f:
+    json.dump({"version": 1, "interval": 60, "records": []}, f)
+check("老文件缺 managed 键不报错", D.load_doc(p3)["managed"] == [])
+
+# merged 时 managed 不该被 merge_records 影响（它只处理 records）
+merged = D.merge_records([], [])
+check("merge_records 只返回记录列表", isinstance(merged, list) and merged == [])
+
+print("\n[22] 控制台客户端：登录 / 401 重登 / 地址转义")
 # ===========================================================================
 import urllib.error  # noqa: E402
 

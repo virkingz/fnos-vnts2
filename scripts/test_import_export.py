@@ -52,6 +52,12 @@ def main():
                        "username": "importuser", "password": "importpass"})
     # 造一个证书文件
     open(os.path.join(sdir, "cert.pem"), "w").write("CERT")
+    # 造出站互联清单（导出必须带上）
+    S.save_dns_doc({"version": 1, "interval": 60,
+                    "records": [{"host": "exported.example.com", "port": 29873,
+                                 "current": "1.2.3.4:29873", "previous": "",
+                                 "last_sync": 0, "last_ok": 0, "last_error": ""}],
+                    "managed": ["1.2.3.4:29873"]})
     # 造日志（导出必须排除）
     open(os.path.join(S.log_dir(), "vnts2.log"), "w").write("LOG-DATA-SHOULD-NOT-EXPORT")
 
@@ -66,6 +72,7 @@ def main():
           "server/settings.json" not in names, names)
     check("含证书", "server/cert.pem" in names)
     check("不含日志", not any(n.endswith(".log") for n in names), names)
+    check("含 dns-ip.json（出站互联清单）", "server/dns-ip.json" in names, names)
     # 数据库内容完整
     with z.open("server/network_control.db") as f:
         con = sqlite3.connect(":memory:")
@@ -106,6 +113,34 @@ def main():
         zz.writestr("config.toml", open(os.path.join(sdir, "config.toml")).read())
     r = S.import_bundle(buf.getvalue())
     check("扁平布局可导入", r["ok"], r)
+
+    print("\n[?] 导入 dns-ip.json（出站互联清单）")
+    # 先把本机清单改成 A，再用含 B 的包导入 → 应以包内为准
+    dns_path = S.DNS_PEERS_FILE
+    S.save_dns_doc({"version": 1, "interval": 60,
+                    "records": [{"host": "local.example.com", "port": 1,
+                                 "current": "", "previous": "",
+                                 "last_sync": 0, "last_ok": 0, "last_error": ""}],
+                    "managed": []})
+    pkg_doc = {"version": 1, "interval": 300,
+               "records": [{"host": "frompkg.example.com", "port": 29873,
+                            "current": "", "previous": "",
+                            "last_sync": 0, "last_ok": 0, "last_error": ""}],
+               "managed": ["9.9.9.9:29873"]}
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as zz:
+        zz.writestr("server/config.toml", open(os.path.join(sdir, "config.toml")).read())
+        zz.writestr("server/dns-ip.json", json.dumps(pkg_doc))
+    r = S.import_bundle(buf2.getvalue())
+    check("含 dns-ip.json 的包可导入", r["ok"], r)
+    check("dns-ip.json 已被恢复", "dns-ip.json" in r.get("restored", []), r.get("restored"))
+    doc = S.load_dns_doc()
+    check("导入后清单以包内为准",
+          [x["host"] for x in doc["records"]] == ["frompkg.example.com"], doc["records"])
+    check("导入后间隔以包内为准", doc["interval"] == 300, doc["interval"])
+    check("导入后 managed 以包内为准", doc["managed"] == ["9.9.9.9:29873"], doc["managed"])
+    check("本机旧清单已被替换",
+          "local.example.com" not in json.dumps(doc, ensure_ascii=False))
 
     shutil.rmtree(base, ignore_errors=True)
     print("\n===== 结果：%d 通过 / %d 失败 =====" % (PASS, FAIL))

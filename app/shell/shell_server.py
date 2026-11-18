@@ -225,10 +225,13 @@ def sync_dns_peers(once=False, log_prefix="域名同步"):
     """执行一轮域名 → IP 同步。
 
     返回 {"ok":bool, "actions":[...], "error":str}。
-    清单为空则**不做任何网络动作**（这是「为空不轮询」的落点）。
+
+    **清单为空不等于什么都不做**：若此前托管过地址（doc["managed"] 非空），
+    本轮负责把它们从核心撤下 —— 这是「从有到无」必须生效的路径。
+    只有在「清单为空且从未托管过任何地址」时才是真正的空转（skipped）。
     """
     doc = load_dns_doc()
-    if not doc.get("records"):
+    if not doc.get("records") and not doc.get("managed"):
         return {"ok": True, "actions": [], "skipped": True, "error": ""}
     if not core_running():
         return {"ok": False, "actions": [], "error": "核心未运行，暂不同步"}
@@ -236,7 +239,7 @@ def sync_dns_peers(once=False, log_prefix="域名同步"):
     with _dns_lock:
         # 重新读一次：可能刚被界面改过
         doc = load_dns_doc()
-        if not doc.get("records"):
+        if not doc.get("records") and not doc.get("managed"):
             return {"ok": True, "actions": [], "skipped": True, "error": ""}
         try:
             client = _console_client()
@@ -280,7 +283,10 @@ def set_dns_peers(hosts, interval=None):
     with _dns_lock:
         old = load_dns_doc()
         doc = {"version": 1, "interval": iv,
-               "records": DP.merge_records(old.get("records") or [], recs)}
+               "records": DP.merge_records(old.get("records") or [], recs),
+               # managed 必须一起带上：清空清单时它是「撤下哪些地址」的唯一依据，
+               # 在这里丢掉就再也无从得知我们曾加过什么。
+               "managed": list(old.get("managed") or [])}
         ensure_dirs()
         save_dns_doc(doc)
 
@@ -290,13 +296,18 @@ def set_dns_peers(hosts, interval=None):
 
 
 def dns_sync_loop(stop_event):
-    """后台轮询线程。清单为空时**空转等待**，不做网络请求。"""
+    """后台轮询线程。
+
+    只要「还有清单」或「还有待撤下的托管地址」就同步；两者都空则空转等待，
+    不做任何网络请求。清理成功后 managed 会归空，线程自然转入空转，不会空转
+    发起请求。
+    """
     while not stop_event.is_set():
         interval = DP.DEFAULT_INTERVAL
         try:
             doc = load_dns_doc()
             interval = doc.get("interval") or DP.DEFAULT_INTERVAL
-            if doc.get("records"):
+            if doc.get("records") or doc.get("managed"):
                 sync_dns_peers()
         except Exception as e:  # noqa: BLE001
             log("域名轮询异常: %s" % e)
@@ -1297,7 +1308,7 @@ def import_bundle(data):
 
     restored = []
     try:
-        targets = ["config.toml", "network_control.db", "mirror", "proxy"]
+        targets = ["config.toml", "network_control.db", "dns-ip.json", "mirror", "proxy"]
         # 老版本的导出包可能只带 settings.json、没有 config.toml：
         # 先把它落盘，随后的渲染会把它并进 config.toml 并删除该文件。
         if not find("config.toml"):
@@ -1329,6 +1340,15 @@ def import_bundle(data):
     # 包内有 config.toml 就直接用它；只剩老 settings.json 的话，
     # render_config() 内部的迁移会把设置并进 config.toml 并删除旧文件。
     render_config()
+
+    # 导入的 dns-ip.json 可能与导入前的出站互联不一致（域名少了、或全没了）。
+    # 立刻同步一次让核心收敛到导入后的清单；否则旧地址会一直留到下一轮轮询。
+    # 注意：包内不含 dns-ip.json 时，本机原有清单保持不变，同样做一次对账。
+    try:
+        sync_dns_peers(log_prefix="域名同步（导入后）")
+    except Exception as e:  # noqa: BLE001
+        log("导入后同步域名失败: %s" % e)
+
     return {"ok": True, "restored": restored, "backup": bool(backup)}
 
 
