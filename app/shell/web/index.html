@@ -93,11 +93,13 @@
         <h2>下载源与代理</h2>
         <div class="field">
           <label>镜像前缀</label>
-          <input type="text" id="mirror" class="inp" placeholder="https://ghfast.top（留空直连 GitHub）">
+          <input type="text" id="mirror" class="inp" placeholder="https://ghproxy.example.com（加速前缀，留空直连 GitHub）">
+          <p class="muted">不带端口的加速地址填这里，请求会拼成 <code>前缀/https://github.com/...</code></p>
         </div>
         <div class="field">
           <label>网络代理</label>
-          <input type="text" id="proxy" class="inp" placeholder="socks5h://127.0.0.1:1080 或 http://127.0.0.1:7890">
+          <input type="text" id="proxy" class="inp" placeholder="http://127.0.0.1:7890（HTTP 代理，必须带端口）">
+          <p class="muted">仅支持 HTTP 代理，需带端口；保存前会实测，连不通则不保存</p>
         </div>
         <div class="row">
           <button class="btn" id="btnSaveNet">保存</button>

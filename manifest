@@ -1,5 +1,5 @@
 appname = vnts-nas
-version = 1.1.0
+version = 1.0.0
 display_name = VNT 服务端
 desc = 基于 VNT 服务端（vnts2）的自建组网节点服务。本插件为管理壳：负责设置管理账号、托管 vnts2 核心进程、在线更新核心，并提供服务器配置导入导出与独立日志目录。网络的创建、设备白名单与查看由 vnts2 自带控制台完成。
 platform = all

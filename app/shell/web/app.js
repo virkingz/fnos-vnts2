@@ -218,25 +218,60 @@
     });
   });
 
+  // 无端口的 http(s) 地址是「加速前缀」不是代理：代理必须有端口，
+  // 把前缀填进代理栏会让 urllib 向它发 CONNECT 而超时，之后所有下载都失败。
+  function looksLikeMirror(v) {
+    return /^https?:\/\/[^\/?#:]+\/?$/i.test(v || '');
+  }
+
   $('#btnSaveNet').addEventListener('click', function () {
+    var mirror = $('#mirror').value.trim();
+    var proxy = $('#proxy').value.trim();
+    if (proxy && looksLikeMirror(proxy)) {
+      if (!confirm('「' + proxy + '」不带端口，是加速镜像前缀，不是代理。\n\n' +
+        '要把它改填到「镜像前缀」吗？\n（点“取消”则不保存，可自行修改后再存）')) {
+        toast('未保存：请把它填到「镜像前缀」，或填写带端口的代理地址', 'warn');
+        return;
+      }
+      mirror = proxy;
+      proxy = '';
+      $('#mirror').value = mirror;
+      $('#proxy').value = '';
+    }
     withBusy(function () {
-      return Promise.all([
-        api('/mirror', { method: 'PUT', json: { mirror: $('#mirror').value } }),
-        api('/proxy', { method: 'PUT', json: { proxy: $('#proxy').value } })
-      ]).then(function () { toast('已保存下载源与代理', 'ok'); })
+      // 顺序保存：代理要实测，失败就不落盘，错误信息也更好读
+      return api('/mirror', { method: 'PUT', json: { mirror: mirror } })
+        .then(function (d) {
+          if (d && d.warning) toast(d.warning, 'warn');
+          return api('/proxy', { method: 'PUT', json: { proxy: proxy } });
+        })
+        .then(function () { toast('已保存下载源与代理', 'ok'); })
         .catch(function (e) { toast(e.message, 'err'); });
     });
   });
   $('#btnTest').addEventListener('click', function () {
     withBusy(function () {
       $('#testResult').textContent = '测试中…';
-      return api('/test-connection').then(function (d) {
-        $('#testResult').textContent = '成功，耗时 ' + d.ms + ' ms';
-        toast('连通性正常', 'ok');
-      }).catch(function (e) {
-        $('#testResult').textContent = '失败';
-        toast(e.message, 'err');
-      });
+      var headers = {};
+      if (TOKEN) headers['X-Panel-Token'] = TOKEN;
+      return fetch(PREFIX + '/panel-api/test-connection', { headers: headers })
+        .then(function (r) {
+          return r.json().catch(function () { return { code: r.status, msg: 'HTTP ' + r.status }; });
+        })
+        .then(function (j) {
+          var d = (j && j.data) || {};
+          var checks = d.checks || [];
+          $('#testResult').innerHTML = checks.map(function (c) {
+            return '<span style="color:' + (c.ok ? '#16a34a' : '#dc2626') + '">' +
+              (c.ok ? '✓' : '✗') + '</span> ' + c.name + '：' + (c.detail || '');
+          }).join('<br>');
+          if (j.code === 0) toast('连通性正常', 'ok');
+          else toast(j.msg || '连通性异常', 'err');
+        })
+        .catch(function (e) {
+          $('#testResult').textContent = '测试失败';
+          toast(e.message, 'err');
+        });
     });
   });
 
@@ -340,11 +375,33 @@
 
   $('#btnExport').addEventListener('click', function () {
     withBusy(function () {
-      var a = document.createElement('a');
-      a.href = PREFIX + '/panel-api/config/export';
-      a.download = '';
-      document.body.appendChild(a); a.click(); a.remove();
-      toast('已开始导出', 'ok');
+      // 不能用 <a href> 直接下载：浏览器导航带不上 X-Panel-Token 头，
+      // 后端会回 401 JSON，Chrome 按 MIME 存成 export.json（下载失败）。
+      // 必须走 fetch 带令牌取 blob，再用 object URL 下载。
+      var headers = {};
+      if (TOKEN) headers['X-Panel-Token'] = TOKEN;
+      return fetch(PREFIX + '/panel-api/config/export', { headers: headers })
+        .then(function (r) {
+          var ct = r.headers.get('Content-Type') || '';
+          if (!r.ok || ct.indexOf('application/zip') < 0) {
+            return r.json().catch(function () { return { msg: 'HTTP ' + r.status }; })
+              .then(function (j) { throw new Error(j.msg || ('HTTP ' + r.status)); });
+          }
+          var cd = r.headers.get('Content-Disposition') || '';
+          var m = /filename="?([^";]+)"?/.exec(cd);
+          var name = m ? m[1] : 'fnos-vnts2-config.zip';
+          return r.blob().then(function (b) { return { blob: b, name: name }; });
+        })
+        .then(function (res) {
+          var url = URL.createObjectURL(res.blob);
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = res.name;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          toast('已导出 ' + res.name, 'ok');
+        })
+        .catch(function (e) { toast('导出失败：' + e.message, 'err'); });
     });
   });
 

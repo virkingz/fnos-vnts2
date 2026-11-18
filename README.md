@@ -238,16 +238,24 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 
 「下载源与代理」里有**两种互相独立**的出网配置，可只配其一，也可同时使用：
 
-| 配置 | 作用层 | 说明 |
-|------|--------|------|
-| **镜像前缀** | URL 层 | 把下载地址改写到镜像站，如 `https://ghfast.top` |
-| **网络代理** | 网络层 | 让请求经代理隧道出去，适合本机需要代理才能上外网 |
+| 配置 | 作用层 | 写法 | 说明 |
+|------|--------|------|------|
+| **镜像前缀** | URL 层 | `https://ghproxy.example.com`（**不带端口**） | 请求会拼成 `前缀/https://github.com/...` |
+| **网络代理** | 网络层 | `http://127.0.0.1:7890`（**必须带端口**） | 让请求经 HTTP 代理隧道出去 |
 
-代理格式：`socks5h://` / `socks5://` / `http://` / `https://`，省略协议按 `http` 处理。
-点「测试连通性」会实际访问 GitHub 并报告耗时。
+**两者别填错栏**：不带端口的是加速前缀，带端口的才是代理。填错会被拦下并提示改填 ——
+把前缀当代理用会一直超时，且之后所有下载都失败。
 
-> 配置代理后所有出网请求统一走 `curl`（Python 标准库的 urllib 不支持 SOCKS5）；
-> 未配置代理时用 urllib，不额外启动进程。
+- 代理仅支持 **HTTP/HTTPS**：管理页走的是 Python 标准库，不支持 SOCKS，
+  填 `socks5h://` 会被明确拒绝（不会静默失败）。请填 Clash 等工具的 HTTP 端口。
+- 代理**保存前先实测**，连不通则不保存，原有设置不变；历史误配会在启动时自动纠正
+  （把代理栏里的加速前缀挪到镜像栏）。
+- 下载核心时按 `配置路径 → 镜像直连 → GitHub 直连` 依次回退，一次误配不会把更新锁死。
+- 点「测试连通性」会**分项**报告：直连 / 镜像前缀 / 网络代理 / 实际下载路径，
+  每项带耗时与原因（超时、拒绝、解析失败、限流、需要认证）。
+
+> Docker 的 `PROXY` 环境变量与 fpk 升级回调走 `curl`，那条路径支持 `socks5h://`；
+> 但为了两边一致，建议统一用一个 HTTP 代理（如 Clash 的 `http://<host>:7890`）。
 
 ## 打包与测试
 
@@ -255,11 +263,12 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 bash scripts/pack.sh            # 产出 fnos-vnts2.fpk
 bash scripts/pack.sh 1.0.1      # 指定版本
 
-python scripts/test_e2e.py            # 端到端（29 项）
+python scripts/test_e2e.py            # 端到端（31 项）
 python scripts/test_import_export.py  # 导入导出专项（21 项）
-python scripts/test_console.py        # 控制台反代与控制台联动（39 项）
-python scripts/test_console_real.py   # 真实前端结构全链路（21 项，素材取自 vnts 二进制）
+python scripts/test_console.py        # 控制台反代与控制台联动（41 项）
+python scripts/test_console_real.py   # 真实前端结构全链路（24 项，素材取自 vnts 二进制）
 python scripts/test_concurrency.py    # 并发与连接复用（8 项）
+python scripts/test_netconf.py        # 下载源与代理：校验/自愈/回退/导出格式（43 项）
 ```
 
 > **Windows 打包注意**：`pack.sh` 会把 `cmd/*` 强制设为 755 并转 LF，跨平台更稳。

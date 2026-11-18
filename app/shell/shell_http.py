@@ -172,8 +172,8 @@ class Handler(BaseHTTPRequestHandler):
     def ok(self, data=None, msg="ok"):
         self._send(200, json_bytes({"code": 0, "msg": msg, "data": data}))
 
-    def err(self, msg, code=400):
-        self._send(code, json_bytes({"code": code, "msg": msg, "data": None}))
+    def err(self, msg, code=400, data=None):
+        self._send(code, json_bytes({"code": code, "msg": msg, "data": data}))
 
     def _body(self):
         try:
@@ -353,16 +353,23 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return self.ok({"mirror": P.get_mirror()})
             if method == "PUT":
-                P.set_mirror(self._json_body().get("mirror", ""))
-                return self.ok({"mirror": P.get_mirror()})
+                res = P.set_mirror(self._json_body().get("mirror", ""))
+                if not res.get("ok"):
+                    return self.err(res.get("error", "保存失败"))
+                out = {"mirror": res.get("mirror", "")}
+                if res.get("warning"):
+                    out["warning"] = res["warning"]
+                return self.ok(out)
             return self.err("方法不允许", 405)
 
         if path == "/proxy":
             if method == "GET":
                 return self.ok({"proxy": P.get_proxy()})
             if method == "PUT":
-                P.set_proxy(self._json_body().get("proxy", ""))
-                return self.ok({"proxy": P.get_proxy()})
+                res = P.set_proxy(self._json_body().get("proxy", ""))
+                if not res.get("ok"):
+                    return self.err(res.get("error", "保存失败"))
+                return self.ok({"proxy": res.get("proxy", "")})
             return self.err("方法不允许", 405)
 
         if path == "/test-connection":
@@ -430,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/config/export":
             data = P.export_bundle()
-            fn = "vnts-nas-config-%s.zip" % time.strftime("%Y%m%d-%H%M%S")
+            fn = "fnos-vnts2-config-%s.zip" % time.strftime("%Y%m%d-%H%M%S")
             return self._send(200, data, "application/zip", extra={
                 "Content-Disposition": 'attachment; filename="%s"' % fn,
             })
@@ -485,14 +492,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 连通性 / 自检 -----------------------------------------------------
     def _test_connection(self):
-        t0 = time.time()
+        """分项探测下载链路：直连 / 镜像 / 代理 / 实际路径。"""
         try:
-            url = S.url_with_mirror("https://api.github.com/repos/vnt-dev/vnts/releases/latest")
-            with S.http_get(url, timeout=15) as r:
-                r.read(1024)
-            return self.ok({"ok": True, "ms": int((time.time() - t0) * 1000), "url": url})
+            res = S.probe_network()
         except Exception as e:  # noqa: BLE001
-            return self.err("连接失败: %s" % e)
+            return self.err("测试失败: %s" % e)
+        if not res.get("ok"):
+            hint = res.get("hint") or "下载链路不通"
+            return self.err(hint, data={"checks": res.get("checks", []),
+                                       "mirror": res.get("mirror", ""),
+                                       "proxy": res.get("proxy", "")})
+        return self.ok(res)
 
     def _selfcheck(self):
         checks = []

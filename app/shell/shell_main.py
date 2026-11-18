@@ -25,6 +25,7 @@ import shell_server as S  # noqa: E402
 def main():
     S.log("=== vnts-nas shell backend starting ===")
     S.ensure_dirs()
+    S.heal_legacy_conf()
     S.trim_logs()
     threading.Thread(target=S.watcher, daemon=True).start()
     threading.Thread(target=H.serve_unix, daemon=True).start()

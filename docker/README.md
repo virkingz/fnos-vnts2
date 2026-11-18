@@ -83,7 +83,7 @@ tar czf vnts-data.tgz --exclude=./log -C /data .
 | `PANEL_TOKEN` | 随机 | 管理页令牌，留空则首次启动生成 |
 | `LOG_DIR` | 空 | **日志目录**（独立于配置） |
 | `MIRROR` | 空 | 下载镜像前缀，如 `https://ghfast.top` |
-| `PROXY` | 空 | 网络代理，如 `socks5h://192.168.1.10:1080` |
+| `PROXY` | 空 | 网络代理，如 `http://192.168.1.10:7890`（管理页内仅支持 HTTP 代理） |
 | `AUTO_DOWNLOAD_CORE` | 1 | 启动时缺核心则自动下载 |
 | `PANEL_BIND` | 0.0.0.0 | 管理页绑定地址（容器内必须是 0.0.0.0） |
 | `TZ` | Asia/Shanghai | 时区 |

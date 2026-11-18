@@ -113,6 +113,33 @@ if [ -n "${PROXY:-}" ]; then
     echo "[vnts] 网络代理: $(vnt_get_proxy)"
 fi
 
+# 3.5) 历史误配自愈：代理栏里没有端口的 http(s) 地址其实是「加速前缀」，
+#      当代理用会一直超时。这里与 shell_server.heal_legacy_conf() 同一策略，
+#      免得本脚本抢在面板启动之前用坏代理去下载核心。
+_heal_proxy_file() {
+    local pf mf p rest
+    pf="$(vnt_proxy_file)"
+    mf="$(vnt_server_dir)/mirror"
+    [ -f "$pf" ] || return 0
+    p="$(vnt_get_proxy)"
+    [ -n "$p" ] || return 0
+    case "$p" in
+    http://*|https://*)
+        rest="${p#*://}"
+        case "$rest" in
+        *:*) : ;;                      # 带端口，是正常代理
+        *)
+            if [ ! -s "$mf" ]; then printf '%s' "$p" > "$mf"; fi
+            : > "$pf"
+            echo "[vnts] 代理栏里的 ${p} 不带端口，不是代理，已按镜像前缀处理"
+            ;;
+        esac
+        ;;
+    esac
+    return 0
+}
+_heal_proxy_file
+
 # 4) 渲染服务端配置（含 logs/log4rs.yaml 指向独立日志目录）
 vnt_render_server_config && echo "[vnts] config.toml 已生成" \
     || echo "[vnts] 警告：config.toml 生成失败"

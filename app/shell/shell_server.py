@@ -24,6 +24,7 @@ import tarfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -147,6 +148,34 @@ def ensure_dirs():
         os.makedirs(d, exist_ok=True)
 
 
+def heal_legacy_conf():
+    """自愈历史误配：把「无端口的 http(s) 地址」从代理挪到镜像前缀。
+
+    这类地址（如 https://ghproxy.example.com）是加速前缀，当代理用必然失败，
+    会让所有下载与连通性测试都超时。启动时纠正一次，避免用户被困在错配置里。
+    注意：此函数不能调用 log()，log() 会反过来调用 ensure_dirs()。
+    """
+    try:
+        proxy = read_file(PROXY_FILE).strip()
+        mirror = read_file(MIRROR_FILE).strip().rstrip("/")
+        if not proxy or not _MIRROR_LIKE.match(proxy):
+            return False
+        write_file(PROXY_FILE, "")
+        msg = "已自动把代理栏里的 %s 移到镜像前缀" % proxy
+        if not mirror:
+            write_file(MIRROR_FILE, proxy.rstrip("/"))
+        else:
+            msg += "（原镜像前缀 %s 保留，未覆盖）" % mirror
+        try:
+            with open(main_log(), "a", encoding="utf-8") as fh:
+                fh.write("%s [shell] %s\n" % (now(), msg))
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+
 def now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -203,19 +232,139 @@ def get_mirror():
     return read_file(MIRROR_FILE).strip().rstrip("/")
 
 
-def set_mirror(prefix):
-    write_file(MIRROR_FILE, (prefix or "").strip().rstrip("/"))
-
-
 def get_proxy():
     return read_file(PROXY_FILE).strip()
 
 
-def set_proxy(p):
-    p = (p or "").strip()
-    if p and "://" not in p:
+# 形如 https://ghproxy.example.com 的地址是「加速镜像前缀」（Cloudflare Worker
+# 之类的反代，用法是 <前缀>/https://github.com/...），不是正向代理。
+# 误填进代理栏后 urllib 会向它发 CONNECT 而无人应答，表现为「连通性测试超时」，
+# 且之后所有下载都会失败。这类地址必须引导到镜像前缀。
+_MIRROR_LIKE = re.compile(r"^https?://[^/?#:]+/?$", re.I)
+_SOCKS_SCHEMES = ("socks", "socks4", "socks4a", "socks5", "socks5h")
+
+
+def normalize_proxy(p):
+    """校验并归一化代理地址。返回 (地址, 错误信息)。空串视为「不使用代理」。"""
+    raw = (p or "").strip()
+    p = raw
+    if not p:
+        return "", ""
+    # 用户显式写了 scheme（https://xxx）才可能是「把加速前缀填错了栏」；
+    # 只写 127.0.0.1 这种，多半是忘了端口。
+    explicit_scheme = "://" in raw
+    if not explicit_scheme:
         p = "http://" + p
-    write_file(PROXY_FILE, p)
+    try:
+        u = urllib.parse.urlsplit(p)
+        scheme = (u.scheme or "").lower()
+        host = u.hostname
+        port = u.port
+    except ValueError:
+        return "", "代理地址格式无效：%s" % p
+
+    if scheme in _SOCKS_SCHEMES:
+        # urllib 只支持 http(s) 代理，socks 填了必然失败，不如直接说清楚
+        return "", ("面板不支持 socks 代理（Python 标准库无此能力）。"
+                    "请填 HTTP 代理地址，例如 Clash 的 http://127.0.0.1:7890")
+    if scheme not in ("http", "https"):
+        return "", "代理地址只支持 http:// 或 https:// 开头"
+    if not host:
+        return "", "代理地址缺少主机名"
+    if not port:
+        if explicit_scheme and _MIRROR_LIKE.match(p):
+            return "", ("这不是代理，是「下载加速前缀」（不带端口）。"
+                        "带端口的才是代理，如 http://127.0.0.1:7890；"
+                        "%s 请填到上面的「镜像前缀」里" % p)
+        return "", "代理地址缺少端口，例如 http://127.0.0.1:7890"
+    # 去掉末尾斜杠，避免拼进请求行
+    return "%s://%s:%d" % (scheme, host, port), ""
+
+
+def normalize_mirror(m):
+    """校验并归一化镜像前缀。返回 (前缀, 错误信息, 警告)。"""
+    m = (m or "").strip().rstrip("/")
+    if not m:
+        return "", "", ""
+    if "://" not in m:
+        m = "https://" + m
+        m = m.rstrip("/")
+    try:
+        u = urllib.parse.urlsplit(m)
+        scheme = (u.scheme or "").lower()
+    except ValueError:
+        return "", "镜像前缀格式无效：%s" % m, ""
+    if scheme not in ("http", "https"):
+        return "", "镜像前缀必须以 http:// 或 https:// 开头", ""
+    if not u.hostname:
+        return "", "镜像前缀缺少主机名", ""
+    if u.port and scheme in _SOCKS_SCHEMES:
+        return "", "这看起来是代理地址，请填到「网络代理」里", ""
+    warn = ""
+    if u.port:
+        warn = "镜像前缀通常不带端口；若 %s 其实是 HTTP 代理，请改填到「网络代理」" % m
+    return m, "", warn
+
+
+def probe_proxy(proxy, timeout=8):
+    """实测代理是否可用。只要收到 HTTP 响应（含 4xx/5xx）即视为通路正常。"""
+    url = "https://api.github.com/repos/vnt-dev/vnts/releases/latest"
+    try:
+        with _open(url, timeout=timeout, proxy=proxy) as r:
+            r.read(64)
+        return True, "OK"
+    except urllib.error.HTTPError as e:
+        # 407 = 代理要求认证；其余状态码说明代理已把请求转出去了
+        if e.code == 407:
+            return False, "代理要求认证（407），面板不支持带账号密码的代理"
+        return True, "HTTP %d" % e.code
+    except Exception as e:  # noqa: BLE001
+        return False, describe_net_error(e)
+
+
+def describe_net_error(e):
+    """把 urllib 的异常翻译成能看懂的话。"""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 407:
+            return "代理要求认证（407）"
+        if e.code in (403, 429):
+            return "已连通，但被 GitHub 限流（HTTP %d，不影响下载）" % e.code
+        return "HTTP %d" % e.code
+    reason = getattr(e, "reason", e)
+    text = str(reason)
+    low = text.lower()
+    if isinstance(reason, TimeoutError) or "timed out" in low:
+        return "连接超时（地址/端口不通，或被墙）"
+    if "connection refused" in low or "拒绝" in text:
+        return "连接被拒绝（端口无人监听）"
+    if "name or service not known" in low or "getaddrinfo" in low:
+        return "域名解析失败"
+    if "certificate" in low or "ssl" in low:
+        return "TLS/证书错误"
+    if "tunnel connection failed" in low:
+        return "代理隧道建立失败（该地址不是正向代理）"
+    return text or "未知错误"
+
+
+def set_proxy(p):
+    """保存代理：先校验格式，再实测一次；不可用则不保存（避免把功能配死）。"""
+    norm, err = normalize_proxy(p)
+    if err:
+        return {"ok": False, "error": err}
+    if norm:
+        ok, detail = probe_proxy(norm)
+        if not ok:
+            return {"ok": False, "error": "代理不可用：%s（未保存，原有设置不变）" % detail}
+    write_file(PROXY_FILE, norm)
+    return {"ok": True, "proxy": norm}
+
+
+def set_mirror(prefix):
+    m, err, warn = normalize_mirror(prefix)
+    if err:
+        return {"ok": False, "error": err}
+    write_file(MIRROR_FILE, m)
+    return {"ok": True, "mirror": m, "warning": warn}
 
 
 def url_with_mirror(u):
@@ -223,14 +372,44 @@ def url_with_mirror(u):
     return "%s/%s" % (m, u) if m else u
 
 
-def _proxy_opener():
-    proxy = get_proxy()
+def _open(url, timeout=30, proxy=None, method="GET"):
+    """打开 URL。
+
+    proxy=None  -> 使用配置里的代理（若有）
+    proxy=""    -> 强制直连，同时禁用系统环境变量里的 http_proxy
+    proxy="x://host:port" -> 用指定代理
+    """
+    headers = {
+        "User-Agent": "vnts-nas-fpk",
+        "Accept": "application/vnd.github+json, */*",
+    }
+    req = urllib.request.Request(url, method=method, headers=headers)
+    if proxy is None:
+        proxy = get_proxy()
     if proxy:
         op = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
-        return op.open
-    return urllib.request.urlopen
+        return op.open(req, timeout=timeout)
+    if proxy == "":  # 显式直连
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return op.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _proxy_opener():
+    """返回一个「按当前配置代理打开 URL」的函数。"""
+    proxy = get_proxy()
+
+    def _opener(req, timeout=30):
+        if proxy:
+            op = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            return op.open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    return _opener
 
 
 def http_get(url, timeout=30):
@@ -378,6 +557,85 @@ def _latest_via_redirect():
 
 
 # ---------------------------------------------------------------------------
+# 下载链路自检
+# ---------------------------------------------------------------------------
+RELEASES_LATEST = "https://github.com/vnt-dev/vnts/releases/latest"
+
+
+def _probe_url(url, proxy, timeout=10):
+    """探测一个 URL 是否可达。返回 (ok, detail)。"""
+    t0 = time.time()
+    try:
+        with _open(url, timeout=timeout, proxy=proxy) as r:
+            try:
+                r.read(256)
+            except Exception:  # noqa: BLE001
+                pass
+        return True, "可达（%d ms）" % int((time.time() - t0) * 1000)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            return True, "已连通（GitHub 限流 %d，不影响下载）" % e.code
+        if e.code == 407:
+            return False, "代理要求认证（407）"
+        if e.code == 404:
+            return False, "HTTP 404：地址不存在（镜像路径可能不对）"
+        return True, "HTTP %d" % e.code
+    except Exception as e:  # noqa: BLE001
+        return False, describe_net_error(e)
+
+
+def probe_network(timeout=10):
+    """分项探测下载链路。
+
+    判定标准是「能不能真的下到核心」：配了镜像/代理时，以
+    「镜像+代理」这条实际路径的结果为准，而不是笼统地报一个失败。
+    """
+    mirror = get_mirror()
+    proxy = get_proxy()
+    checks = []
+
+    def add(name, ok, detail, url=""):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail, "url": url})
+
+    direct_ok, direct_detail = _probe_url(RELEASES_LATEST, "", timeout)
+    add("直连 GitHub", direct_ok, direct_detail, RELEASES_LATEST)
+
+    mirror_ok = None
+    if mirror:
+        mu = url_with_mirror(RELEASES_LATEST)
+        mirror_ok, md = _probe_url(mu, "", timeout)
+        add("镜像前缀", mirror_ok, md, mu)
+
+    proxy_ok = None
+    if proxy:
+        proxy_ok, pd = _probe_url(RELEASES_LATEST, proxy, timeout)
+        add("网络代理", proxy_ok, pd, RELEASES_LATEST)
+
+    hint = ""
+    if mirror or proxy:
+        pu = url_with_mirror(RELEASES_LATEST)
+        pu_ok, pu_detail = _probe_url(pu, None if proxy else "", timeout)
+        add("实际下载路径", pu_ok, pu_detail, pu)
+        ok = pu_ok
+    else:
+        ok = direct_ok
+
+    # 给能直接照做的修法，而不是只说失败
+    if not ok:
+        if proxy and _MIRROR_LIKE.match(proxy):
+            hint = ("代理栏里的 %s 是「加速前缀」不是代理，请清空代理、把它填到镜像前缀"
+                    % proxy)
+        elif proxy and proxy_ok is False:
+            hint = "代理连不上：清空代理后重试，或改成 http://127.0.0.1:7890 这类带端口的地址"
+        elif mirror and mirror_ok is False:
+            hint = "镜像前缀不可用：清空镜像直连 GitHub，或换一个加速前缀"
+        elif not direct_ok:
+            hint = "直连 GitHub 不通（常见于国内网络），请配置镜像前缀或代理"
+    return {"ok": ok, "checks": checks, "hint": hint,
+            "mirror": mirror, "proxy": proxy}
+
+
+# ---------------------------------------------------------------------------
 # 核心安装
 # ---------------------------------------------------------------------------
 def core_asset_url(ver):
@@ -413,16 +671,42 @@ def install_core_from_bytes(data, ver=""):
     return {"ok": True, "version": ver or installed_version()}
 
 
+def _github_asset_url(ver, asset):
+    return "https://github.com/vnt-dev/vnts/releases/download/v%s/%s" % (ver, asset)
+
+
 def download_core(ver):
-    url, asset = core_asset_url(ver)
-    log("下载核心 %s <- %s" % (ver, url))
-    with http_get(url, timeout=600) as r:
-        data = r.read()
-    res = install_core_from_bytes(data, ver)
-    if res.get("ok"):
-        write_file(CORE_SRC_FILE, "version=%s\nasset=%s\nurl=%s\ninstalled_at=%s\n"
-                   % (ver, asset, url, now()))
-    return res
+    """下载核心二进制。
+
+    一次误配（例如把加速前缀填进代理栏）不该让「更新核心」永久不可用，
+    因此按 配置路径 -> 镜像直连 -> GitHub 直连 依次尝试，并逐次记日志。
+    """
+    url, asset = core_asset_url(ver)          # url 已带镜像前缀
+    direct = _github_asset_url(ver, asset)
+
+    plan = [("配置路径", url, None)]
+    if get_mirror():
+        plan.append(("镜像直连", url, ""))
+    if get_mirror() or get_proxy():
+        plan.append(("GitHub 直连", direct, ""))
+
+    last = None
+    for label, u, px in plan:
+        log("下载核心 %s <- [%s] %s" % (ver, label, u))
+        try:
+            with _open(u, timeout=600, proxy=px) as r:
+                data = r.read()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            log("下载失败 [%s]：%s" % (label, describe_net_error(e)))
+            continue
+        res = install_core_from_bytes(data, ver)
+        if res.get("ok"):
+            write_file(CORE_SRC_FILE, "version=%s\nasset=%s\nurl=%s\ninstalled_at=%s\n"
+                       % (ver, asset, u, now()))
+        return res
+    return {"ok": False, "error": "下载失败：%s"
+            % (describe_net_error(last) if last else "未知错误")}
 
 
 def rollback_core():
