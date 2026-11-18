@@ -47,8 +47,15 @@ SERVER_DIR = os.path.join(PKGVAR, "server")
 CACHE_DIR = os.path.join(PKGVAR, "cache")
 PORT_FILE = os.path.join(PKGVAR, "ports.env")
 LOGDIR_FILE = os.path.join(PKGVAR, "logdir")
-# 核心日志级别与轮转设置（级别 / 单文件 MB / 保留份数）
+# 核心日志级别与轮转设置（级别 / 单文件 KB / 保留份数）
 LOG_CONF_FILE = os.path.join(PKGVAR, "logconf.json")
+# 三协议的独立端口。留空（不写或写空）= 复用 SERVICE_PORT。
+#
+# 为什么要单独存而不能从 config.toml 反推：config.toml 里只有一个
+# 展开后的端口数字，无法区分「用户显式填了 29872」与「留空所以复用了
+# 29872」。一旦用户改了 SERVICE_PORT，前者不该跟随、后者必须跟随 ——
+# 反推必然出错（曾因此出现「改了服务端口，tcp_bind 却不跟随」的 bug）。
+PROTO_PORTS_FILE = os.path.join(SERVER_DIR, "proto-ports.json")
 MIRROR_FILE = os.path.join(SERVER_DIR, "mirror")
 PROXY_FILE = os.path.join(SERVER_DIR, "proxy")
 # 出站互联域名清单 + 解析结果（与 mirror/proxy 同级，导出包自动带上）
@@ -131,13 +138,22 @@ def save_log_dir(d):
 # **不需要重启核心** —— 这点对「临时开 debug 排查」很关键。
 # ---------------------------------------------------------------------------
 LOG_LEVELS = ("trace", "debug", "info", "warn", "error")
-LOG_MAX_MB_MIN, LOG_MAX_MB_MAX = 1, 1024
+# 单文件上限以 **KB** 为单位存储，这样 512KB 这类小档位能精确表达。
+# 界面按 KB 收，渲染时能被 1024 整除则写成 mb（更可读），否则写 kb。
+LOG_KB_MIN, LOG_KB_MAX = 64, 1024 * 1024          # 64KB ~ 1GB
 LOG_KEEP_MIN, LOG_KEEP_MAX = 1, 100
+DEFAULT_LOG_KB = 10240                             # 默认 10MB
 
 
 def load_log_conf():
-    """读日志配置。缺失或损坏时回到默认（info / 10MB / 5 份）。"""
-    conf = {"level": "info", "max_mb": 10, "keep": 5}
+    """读日志配置。缺失或损坏时回到默认（info / 10MB / 5 份）。
+
+    兼容两种历史键：
+      - max_mb（上一版，整 MB）
+      - max_kb（当前，精确到 KB）
+    两者都接受，统一归一化到 max_kb。
+    """
+    conf = {"level": "info", "max_kb": DEFAULT_LOG_KB, "keep": 5}
     raw = read_file(LOG_CONF_FILE).strip()
     if not raw:
         return conf
@@ -150,19 +166,37 @@ def load_log_conf():
     lv = str(data.get("level") or "").lower()
     if lv in LOG_LEVELS:
         conf["level"] = lv
-    for key, lo, hi in (("max_mb", LOG_MAX_MB_MIN, LOG_MAX_MB_MAX),
-                        ("keep", LOG_KEEP_MIN, LOG_KEEP_MAX)):
+    # 优先读 max_kb；没有则用 max_mb 换算（老配置）
+    kb = None
+    if data.get("max_kb") is not None:
+        kb = data.get("max_kb")
+    elif data.get("max_mb") is not None:
         try:
-            n = int(data.get(key))
+            kb = int(data.get("max_mb")) * 1024
         except (TypeError, ValueError):
-            continue
-        if lo <= n <= hi:
-            conf[key] = n
+            kb = None
+    if kb is not None:
+        try:
+            n = int(kb)
+        except (TypeError, ValueError):
+            n = None
+        if n is not None and LOG_KB_MIN <= n <= LOG_KB_MAX:
+            conf["max_kb"] = n
+    try:
+        n = int(data.get("keep"))
+    except (TypeError, ValueError):
+        n = None
+    if n is not None and LOG_KEEP_MIN <= n <= LOG_KEEP_MAX:
+        conf["keep"] = n
     return conf
 
 
-def normalize_log_conf(level, max_mb, keep):
-    """校验日志配置。返回 (配置, 错误列表)。只校验传进来的字段。"""
+def normalize_log_conf(level, max_kb, keep):
+    """校验日志配置。返回 (配置, 错误列表)。只校验传进来的字段。
+
+    max_kb 若为浮点或带小数，四舍五入到整数 KB —— 界面上用 MB 输入时
+    可能是 0.5 这种值。
+    """
     conf = load_log_conf()
     errs = []
     if level is not None:
@@ -171,17 +205,18 @@ def normalize_log_conf(level, max_mb, keep):
             errs.append("日志级别只支持 %s" % " / ".join(LOG_LEVELS))
         else:
             conf["level"] = lv
-    if max_mb is not None:
+    if max_kb is not None and str(max_kb).strip() != "":
         try:
-            n = int(max_mb)
+            n = int(round(float(max_kb)))
         except (TypeError, ValueError):
-            errs.append("文件大小上限需为整数（MB）")
+            errs.append("文件大小上限需为数字（KB）")
         else:
-            if not (LOG_MAX_MB_MIN <= n <= LOG_MAX_MB_MAX):
-                errs.append("文件大小上限需在 %d-%d MB 之间" % (LOG_MAX_MB_MIN, LOG_MAX_MB_MAX))
+            if not (LOG_KB_MIN <= n <= LOG_KB_MAX):
+                errs.append("文件大小上限需在 %d KB - %d KB 之间"
+                            % (LOG_KB_MIN, LOG_KB_MAX))
             else:
-                conf["max_mb"] = n
-    if keep is not None:
+                conf["max_kb"] = n
+    if keep is not None and str(keep).strip() != "":
         try:
             n = int(keep)
         except (TypeError, ValueError):
@@ -207,8 +242,12 @@ def save_log_conf(conf):
 def log_conf_view():
     conf = load_log_conf()
     conf["levels"] = list(LOG_LEVELS)
-    conf["max_mb_range"] = [LOG_MAX_MB_MIN, LOG_MAX_MB_MAX]
+    conf["max_kb_range"] = [LOG_KB_MIN, LOG_KB_MAX]
     conf["keep_range"] = [LOG_KEEP_MIN, LOG_KEEP_MAX]
+    # 便于界面直接显示
+    conf["max_mb"] = round(conf["max_kb"] / 1024.0, 2)
+    # 常用档位，界面做成下拉/快捷项
+    conf["presets_kb"] = [512, 1024, 5120, 10240, 51200, 102400]
     # 核心是否在跑，决定「改完是否立即生效」的提示
     conf["core_running"] = bool(core_running())
     return conf
@@ -838,28 +877,58 @@ def get_console_username():
 # 配置
 # ---------------------------------------------------------------------------
 def render_config():
-    """渲染 config.toml 与 logs/log4rs.yaml。"""
+    """渲染 config.toml 与 logs/log4rs.yaml。
+
+    显式带上独立端口（proto-ports.json）—— 否则 C.render 内部用
+    load_settings 反推，会把「复用」误判为「固定端口」，导致改了
+    SERVICE_PORT 后复用者不跟随（曾出现的 bug）。
+    """
     ensure_dirs()
-    return C.render(SERVER_DIR, log_dir(), PORT_FILE, log_conf=load_log_conf())
+    return C.render(SERVER_DIR, log_dir(), PORT_FILE,
+                    settings=_settings_with_proto_ports(),
+                    log_conf=load_log_conf())
 
 
 def get_settings():
-    return C.load_settings(SERVER_DIR)
+    """界面读取用：config.toml 的设置 + 独立端口。
+
+    独立端口的**意图**（复用还是固定）不在 config.toml 里 —— 那里只有
+    展开后的端口数字，反推不出用户本意。因此单独存在 proto-ports.json，
+    这里合并进来给界面回显。
+    """
+    s = C.load_settings(SERVER_DIR, PORT_FILE)
+    s.update(load_proto_ports())
+    return s
 
 
 def update_settings(patch):
-    """保存服务端设置：直接写 config.toml（唯一配置文件）。
+    """保存服务端设置：写 config.toml（唯一配置文件）。
+
+    独立端口不写进 config.toml，而是存 proto-ports.json（意图要与展开后的
+    端口分开，否则「改服务端口时复用者是否跟随」会判断错）。
 
     只落盘，不重启核心 —— 由用户自行决定何时重启使其生效。
     """
-    s = C.load_settings(SERVER_DIR)
-    s.update(patch or {})
-    errs = C.validate(s)
+    patch = patch or {}
+    s = C.load_settings(SERVER_DIR, PORT_FILE)
+    # 现有独立端口先合并进来，保证「只改一项」时其余不回退成复用
+    s.update(load_proto_ports())
+    s.update(patch)
+    # 独立端口不能与面板/控制台/互联端口撞车，也需校验协议之间互不冲突
+    ports = load_ports()
+    errs = C.validate(
+        s,
+        reserved=[ports.get("PANEL_PORT"), ports.get("CONSOLE_PORT"),
+                  s.get("peer_bind_port") if s.get("enable_peer") else None],
+        reserved_names=["面板端口", "控制台端口", "服务端互联端口"])
     if errs:
         return {"ok": False, "errors": errs}
     ensure_dirs()
+    # 独立端口单独落盘（空值会被省略，表示复用）
+    save_proto_ports({k: s.get(k) for k in ("tcp_port", "quic_port", "ws_port")})
     # 一次渲染同时写出 config.toml 与 logs/log4rs.yaml，避免两次读改写
-    C.render(SERVER_DIR, log_dir(), PORT_FILE, settings=s)
+    C.render(SERVER_DIR, log_dir(), PORT_FILE, settings=s,
+             log_conf=load_log_conf())
     return {"ok": True, "restart_needed": core_running()}
 
 
@@ -1417,6 +1486,7 @@ EXPORT_FILES = [
     ("config.toml", "server/config.toml"),
     ("network_control.db", "server/network_control.db"),
     ("dns-ip.json", "server/dns-ip.json"),
+    ("proto-ports.json", "server/proto-ports.json"),
     ("mirror", "server/mirror"),
     ("proxy", "server/proxy"),
     ("cert.pem", "server/cert.pem"),
@@ -1545,6 +1615,60 @@ def import_bundle(data):
         log("导入后同步域名失败: %s" % e)
 
     return {"ok": True, "restored": restored, "backup": bool(backup)}
+
+
+# ---------------------------------------------------------------------------
+# 三协议独立端口（留空 = 复用 SERVICE_PORT）
+# ---------------------------------------------------------------------------
+def load_proto_ports():
+    """读三协议独立端口。空串表示复用；文件缺失即全部复用。"""
+    out = {"tcp_port": "", "quic_port": "", "ws_port": ""}
+    raw = read_file(PROTO_PORTS_FILE).strip()
+    if not raw:
+        return out
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return out
+    if not isinstance(data, dict):
+        return out
+    for k in out:
+        v = data.get(k)
+        if v is None or str(v).strip() == "":
+            continue
+        try:
+            n = int(str(v).strip())
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 65535:
+            out[k] = n
+    return out
+
+
+def save_proto_ports(proto):
+    """保存三协议独立端口。空值直接省略（表示复用）。"""
+    data = {}
+    for k in ("tcp_port", "quic_port", "ws_port"):
+        v = (proto or {}).get(k)
+        if v is None or str(v).strip() == "":
+            continue
+        data[k] = int(str(v).strip())
+    if data:
+        write_file(PROTO_PORTS_FILE, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    else:
+        _rm(PROTO_PORTS_FILE)
+    return data
+
+
+def _settings_with_proto_ports():
+    """设置 + 独立端口，供渲染使用。
+
+    独立端口的**意图**存在 proto-ports.json，不写进 config.toml
+    （那里只有展开后的端口数字，反推不出用户是想复用还是想固定）。
+    """
+    s = C.load_settings(SERVER_DIR, PORT_FILE)
+    s.update(load_proto_ports())
+    return s
 
 
 # ---------------------------------------------------------------------------

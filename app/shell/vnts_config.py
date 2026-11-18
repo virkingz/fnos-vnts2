@@ -46,10 +46,16 @@ DEFAULTS = {
     "custom_nets": {},          # {网络编号: 网段}
     "group_types": {},          # {网络编号: "Network"|"RemoteDesktop"}
     "persistence": True,
-    # 监听开关（端口统一由 ports.env 的 SERVICE_PORT 决定）
+    # 监听开关（端口默认复用 ports.env 的 SERVICE_PORT）
     "enable_tcp": True,
     "enable_quic": True,
     "enable_wss": True,
+    # 三协议各自独立端口。**留空（默认）= 复用 SERVICE_PORT**。
+    # 填了才分开监听 —— 这样绝大多数场景零配置，也能满足
+    # 「tcp/quic/ws 用不同端口」或「不与别的服务撞端口」的需求。
+    "tcp_port": "",
+    "quic_port": "",
+    "ws_port": "",
     # 控制台管理员账号
     "username": "admin",
     "password": "admin",
@@ -105,8 +111,13 @@ def read_ports(ports_file=None):
     return service_port, console_port
 
 
-def load_settings(server_dir):
-    """解析 config.toml 得到界面用的设置字典；文件不存在则返回默认值。"""
+def load_settings(server_dir, ports_file=None):
+    """解析 config.toml 得到界面用的设置字典；文件不存在则返回默认值。
+
+    ports_file 用于判定各协议端口是否只是「复用默认端口」—— 传了才能把
+    tcp/quic/ws 的独立端口与默认端口区分开（见 _apply_toml）。
+    不传时退化为「一律视为独立端口」，仅影响界面回显，不影响渲染。
+    """
     s = _default_settings()
     p = config_path(server_dir)
     if not os.path.isfile(p):
@@ -115,7 +126,10 @@ def load_settings(server_dir):
         text = open(p, encoding="utf-8", errors="replace").read()
     except OSError:
         return s
-    _apply_toml(s, parse_toml_simple(text))
+    service_port = None
+    if ports_file:
+        service_port = read_ports(ports_file)[0]
+    _apply_toml(s, parse_toml_simple(text), service_port=service_port)
     return s
 
 
@@ -178,8 +192,12 @@ def _is_ipv4_net(net):
     return True
 
 
-def validate(s):
-    """返回错误信息列表，空列表表示通过。"""
+def validate(s, reserved=None, reserved_names=None):
+    """返回错误信息列表，空列表表示通过。
+
+    reserved / reserved_names 用于把独立端口与外部保留端口（面板、控制台、
+    服务端互联）做冲突检查；不传时只检查协议之间是否互撞。
+    """
     errs = []
     if not _is_ipv4_net(s.get("network", "")):
         errs.append("默认虚拟网段需为 IPv4 CIDR，如 10.26.0.0/24")
@@ -206,6 +224,8 @@ def validate(s):
     for code in (s.get("group_types") or {}):
         if code in (s.get("custom_nets") or {}):
             pass  # 允许同时存在
+    errs.extend(validate_proto_ports(s, reserved=reserved,
+                                     reserved_names=reserved_names))
     # 出站互联写入 SQLite，数据库只在 persistence=true 时初始化：
     # 关掉持久化后 add/remove_peer_server 会直接失败，域名轮询无从生效。
     # 因此只要配了出站互联域名，就必须保持持久化开启。
@@ -213,6 +233,57 @@ def validate(s):
     hosts = s.get("dns_hosts") or []
     if hosts and not s.get("persistence", True):
         errs.append("配置了出站互联域名时必须开启「数据持久化」（互联记录存在数据库中）")
+    return errs
+
+
+def validate_proto_ports(s, reserved=None, reserved_names=None):
+    """校验 tcp/quic/ws 的独立端口。返回错误列表。
+
+    规则：
+      - 留空 = 复用默认端口，合法（也是默认行为，无需配置）。
+      - 填了必须是 1-65535 的整数。
+      - **各协议若都显式指定了端口，彼此不能相同**（同机同协议栈下会抢端口）。
+        留空的那个不算冲突 —— 它跟随默认端口，由调用方用 service_port 判断。
+      - 若给了 reserved（如面板端口、控制台端口、互联端口），独立端口也不能与之相同。
+
+    reserved 里的值允许为 None/''（表示未启用）。
+    """
+    errs = []
+    label = {"tcp": "TCP", "quic": "QUIC", "ws": "WebSocket"}
+    used = {}                       # 端口 -> 协议中文名，用于报冲突
+
+    for proto in ("tcp", "quic", "ws"):
+        raw = s.get(proto + "_port")
+        if raw is None or str(raw).strip() == "":
+            continue                # 留空 = 复用默认端口
+        try:
+            n = int(str(raw).strip())
+        except (TypeError, ValueError):
+            errs.append("%s 独立端口需为整数（留空则复用默认端口）" % label[proto])
+            continue
+        if not (1 <= n <= 65535):
+            errs.append("%s 独立端口需在 1-65535 之间" % label[proto])
+            continue
+        if n in used:
+            errs.append("%s 与 %s 的独立端口相同（%d），请改为不同端口或留空复用"
+                        % (label[proto], used[n], n))
+            continue
+        used[n] = label[proto]
+
+    # 与其它保留端口比对（面板 / 控制台 / 服务端互联）
+    reserved = reserved or []
+    names = reserved_names or []
+    for n, proto_name in used.items():
+        for i, r in enumerate(reserved):
+            try:
+                rn = int(r)
+            except (TypeError, ValueError):
+                continue
+            if rn != n:
+                continue
+            other = names[i] if i < len(names) else "其它服务"
+            errs.append("%s 独立端口 %d 与%s冲突，请改用其它端口"
+                        % (proto_name, n, other))
     return errs
 
 
@@ -231,8 +302,30 @@ def _toml_list(values):
     return "[" + ", ".join(_toml_str(v) for v in values) + "]"
 
 
+def _proto_port(s, proto, service_port):
+    """取某协议应监听的端口。
+
+    留空（或非法）= 复用 service_port；填了有效端口就用它。
+    这样默认行为与老版本完全一致，无需迁移。
+    """
+    v = s.get(proto + "_port")
+    if v is None or str(v).strip() == "":
+        return int(service_port)
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return int(service_port)
+    if 1 <= n <= 65535:
+        return n
+    return int(service_port)
+
+
 def render_config_toml(s, service_port, console_port):
-    """生成 config.toml 文本。service_port 用于 tcp/quic/ws，console_port 为 web_bind。"""
+    """生成 config.toml 文本。
+
+    service_port 是默认端口；若 tcp_port/quic_port/ws_port 单独指定了，
+    对应协议就用各自的端口（即「不复用」）。console_port 为 web_bind。
+    """
     ip = "[::]"
     lines = []
     lines.append("# 由 vnts-nas 管理页生成，请勿手工编辑（会被覆盖）")
@@ -241,13 +334,13 @@ def render_config_toml(s, service_port, console_port):
 
     if s.get("enable_tcp"):
         lines.append("# 绑定 tcp 地址，不写则不启用 tcp 服务")
-        lines.append('tcp_bind = "%s:%d"' % (ip, service_port))
+        lines.append('tcp_bind = "%s:%d"' % (ip, _proto_port(s, "tcp", service_port)))
     if s.get("enable_quic"):
         lines.append("# 绑定 quic 地址，不写则不启用 quic 服务")
-        lines.append('quic_bind = "%s:%d"' % (ip, service_port))
+        lines.append('quic_bind = "%s:%d"' % (ip, _proto_port(s, "quic", service_port)))
     if s.get("enable_wss"):
         lines.append("# 绑定 wss 地址，不写则不启用 wss 服务")
-        lines.append('ws_bind = "%s:%d"' % (ip, service_port))
+        lines.append('ws_bind = "%s:%d"' % (ip, _proto_port(s, "ws", service_port)))
 
     lines.append("# 默认虚拟网段")
     lines.append("network = %s" % _toml_str(s.get("network", "10.26.0.0/24")))
@@ -317,14 +410,24 @@ def render_config_toml(s, service_port, console_port):
 # ---------------------------------------------------------------------------
 # log4rs.yaml 渲染（日志分离核心）
 # ---------------------------------------------------------------------------
-def render_log4rs(log_dir, level="info", max_mb=10, keep=5):
+def render_log4rs(log_dir, level="info", max_kb=10240, keep=5):
     """生成 log4rs 配置：rolling_file 指向 log_dir/vnts2.log。
 
     使用绝对路径，因此无论 CWD 在哪，日志都落在 log_dir。
+
+    max_kb 是单文件上限（KB）。log4rs 的 size 支持 "b"/"kb"/"mb"/"gb"/"tb"
+    及 *ib 写法，**大小写不敏感**（源码 size.rs 的 deserialize_limit 用
+    eq_ignore_ascii_case 比较），因此 512 KB 直接写 "512 kb" 即可。
+    为可读性，能被 1024 整除时用 mb，否则用 kb —— 两者等价。
     """
     log_dir = os.path.abspath(log_dir)
     log_file = os.path.join(log_dir, "vnts2.log").replace("\\", "/")
     log_pattern = os.path.join(log_dir, "vnts2.{}.log").replace("\\", "/")
+    max_kb = int(max_kb)
+    if max_kb >= 1024 and max_kb % 1024 == 0:
+        limit = "%d mb" % (max_kb // 1024)
+    else:
+        limit = "%d kb" % max_kb
     return (
         "refresh_rate: 30 seconds\n"
         "appenders:\n"
@@ -338,7 +441,7 @@ def render_log4rs(log_dir, level="info", max_mb=10, keep=5):
         "      kind: compound\n"
         "      trigger:\n"
         "        kind: size\n"
-        "        limit: {max_mb} mb\n"
+        "        limit: {limit}\n"
         "      roller:\n"
         "        kind: fixed_window\n"
         "        pattern: {log_pattern}\n"
@@ -356,7 +459,7 @@ def render_log4rs(log_dir, level="info", max_mb=10, keep=5):
     ).format(
         log_file=log_file,
         log_pattern=log_pattern,
-        max_mb=int(max_mb),
+        limit=limit,
         keep=int(keep),
         level=level,
     )
@@ -371,7 +474,7 @@ def render(server_dir, log_dir, ports_file=None, settings=None, log_conf=None):
     settings 传入时用它（保存设置场景，避免「读—改—写」间的竞态）；
     否则从现有 config.toml 读。
 
-    log_conf 控制核心日志：{"level","max_mb","keep"}。不传则用默认
+    log_conf 控制核心日志：{"level","max_kb","keep"}。不传则用默认
     （info / 10MB / 5 份）—— 保持向后兼容，老调用方无需改动。
     """
     os.makedirs(server_dir, exist_ok=True)
@@ -380,7 +483,7 @@ def render(server_dir, log_dir, ports_file=None, settings=None, log_conf=None):
     # 一次性迁移：老版本的 settings.json 并进来后删除
     _migrate_legacy_settings(server_dir)
 
-    s = settings if settings is not None else load_settings(server_dir)
+    s = settings if settings is not None else load_settings(server_dir, ports_file)
     errs = validate(s)
     if errs:
         raise SystemExit("配置校验失败: " + "; ".join(errs))
@@ -398,7 +501,7 @@ def render(server_dir, log_dir, ports_file=None, settings=None, log_conf=None):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(render_log4rs(log_dir,
                               level=lc.get("level", "info"),
-                              max_mb=lc.get("max_mb", 10),
+                              max_kb=lc.get("max_kb", 10240),
                               keep=lc.get("keep", 5)))
     os.replace(tmp, l4)
 
@@ -504,7 +607,7 @@ def _unquote(x):
     return x.replace('\\"', '"').replace("\\\\", "\\")
 
 
-def _apply_toml(s, t):
+def _apply_toml(s, t, service_port=None):
     """把 parse_toml_simple 的结果映射进设置字典（原地修改并返回）。"""
     if "network" in t:
         s["network"] = t["network"]
@@ -523,6 +626,18 @@ def _apply_toml(s, t):
     s["enable_tcp"] = "tcp_bind" in t
     s["enable_quic"] = "quic_bind" in t
     s["enable_wss"] = "ws_bind" in t
+
+    # 三协议独立端口：各自 bind 的端口若与默认 service_port 相同，
+    # 就视为「复用」（存空串），否则记为独立端口。
+    #
+    # 为什么必须这样判：若把复用的端口原样写成独立端口，之后用户改
+    # 「服务端口」时，三个协议不会跟着变 —— 与「留空=复用」的语义不符。
+    for proto, key in (("tcp", "tcp_bind"), ("quic", "quic_bind"), ("ws", "ws_bind")):
+        p = _port_of(t.get(key)) if key in t else None
+        if p and (not service_port or p != int(service_port)):
+            s[proto + "_port"] = p
+        else:
+            s[proto + "_port"] = ""
 
     # 服务端互联
     if "server_quic_bind" in t:

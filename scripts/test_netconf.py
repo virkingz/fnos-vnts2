@@ -207,6 +207,48 @@ def main():
     check("含 config.toml", "server/config.toml" in z.namelist(), z.namelist())
     check("不含 settings.json", not any("settings.json" in n for n in z.namelist()))
 
+    # ------------------------------------------------------------------
+    print("\n[?] tcp/quic/ws 端口：默认复用，可分别设置")
+    # ------------------------------------------------------------------
+    import vnts_config as C
+    base = C._default_settings()
+    check("默认三协议端口为空（=复用）",
+          base["tcp_port"] == "" and base["quic_port"] == "" and base["ws_port"] == "",
+          {k: base[k] for k in ("tcp_port", "quic_port", "ws_port")})
+
+    def binds(sv, sp=29872):
+        out = C.render_config_toml(sv, sp, 29071)
+        return [l.split('"')[1] for l in out.splitlines()
+                if "_bind" in l and "server_quic" not in l and "web_bind" not in l]
+
+    check("默认复用同一端口", binds(dict(base)) == ["[::]:29872"] * 3, binds(dict(base)))
+
+    s1 = dict(base); s1["quic_port"] = 31000
+    check("只给 quic 独立端口，其余仍复用",
+          binds(s1) == ["[::]:29872", "[::]:31000", "[::]:29872"], binds(s1))
+
+    s2 = dict(base)
+    s2.update({"tcp_port": 30001, "quic_port": 30002, "ws_port": 30003})
+    check("三者可分设不同端口",
+          binds(s2) == ["[::]:30001", "[::]:30002", "[::]:30003"], binds(s2))
+
+    s3 = dict(base); s3["ws_port"] = 40000
+    check("改默认端口时复用者跟随、独立者不跟随",
+          binds(s3, 45000) == ["[::]:45000", "[::]:45000", "[::]:40000"],
+          binds(s3, 45000))
+
+    # 校验
+    c1 = dict(base); c1.update({"tcp_port": 30000, "quic_port": 30000})
+    check("协议间端口相同被拒", C.validate_proto_ports(c1), C.validate_proto_ports(c1))
+    c2 = dict(base); c2["tcp_port"] = 70000
+    check("端口越界被拒", C.validate_proto_ports(c2))
+    c3 = dict(base); c3["tcp_port"] = "abc"
+    check("端口非数字被拒", C.validate_proto_ports(c3))
+    c4 = dict(base); c4["tcp_port"] = 19098
+    check("与面板端口冲突被拒",
+          C.validate_proto_ports(c4, reserved=[19098], reserved_names=["面板端口"]))
+    check("留空不参与冲突检查", not C.validate_proto_ports(dict(base)))
+
     print("")
     print("通过 %d 项，失败 %d 项" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1

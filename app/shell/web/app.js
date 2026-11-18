@@ -289,6 +289,10 @@
     $('#sTcp').checked = !!s.enable_tcp;
     $('#sQuic').checked = !!s.enable_quic;
     $('#sWss').checked = !!s.enable_wss;
+    // 留空表示复用「组网服务端口」
+    $('#sTcpPort').value = s.tcp_port || '';
+    $('#sQuicPort').value = s.quic_port || '';
+    $('#sWsPort').value = s.ws_port || '';
     $('#sPeerOn').checked = !!s.enable_peer;
     $('#sPeerPort').value = s.peer_bind_port || 29873;
     $('#sPeerToken').value = s.server_token || '';
@@ -313,6 +317,10 @@
       enable_tcp: $('#sTcp').checked,
       enable_quic: $('#sQuic').checked,
       enable_wss: $('#sWss').checked,
+      // 空串表示复用组网服务端口（后端的默认行为）
+      tcp_port: $('#sTcpPort').value.trim(),
+      quic_port: $('#sQuicPort').value.trim(),
+      ws_port: $('#sWsPort').value.trim(),
       enable_peer: $('#sPeerOn').checked,
       peer_bind_port: parseInt($('#sPeerPort').value, 10) || 29873,
       server_token: $('#sPeerToken').value.trim()
@@ -523,10 +531,27 @@
   });
 
   // ---------------- vnts2 日志级别与轮转 ----------------
+  // 上限统一按 KB 提交；界面上用户可用 KB 或 MB 输入。
+  function logSetMax(kb) {
+    if (kb % 1024 === 0) {
+      $('#logMax').value = kb / 1024;
+      $('#logMaxUnit').value = 'mb';
+    } else {
+      $('#logMax').value = kb;
+      $('#logMaxUnit').value = 'kb';
+    }
+  }
+
+  function logMaxKb() {
+    var n = parseFloat($('#logMax').value);
+    if (isNaN(n)) return '';
+    return Math.round(n * ($('#logMaxUnit').value === 'mb' ? 1024 : 1));
+  }
+
   function loadLogConf() {
     api('/logconf').then(function (c) {
       $('#logLevel').value = c.level || 'info';
-      $('#logMaxMb').value = c.max_mb || 10;
+      logSetMax(c.max_kb || 10240);
       $('#logKeep').value = c.keep || 5;
       $('#logConfHint').textContent =
         '修改后约 30 秒自动生效（核心每隔 30 秒重读配置），无需重启。' +
@@ -534,19 +559,28 @@
     }).catch(function (e) { toast(e.message, 'err'); });
   }
 
+  $('#logMax512').addEventListener('click', function (e) {
+    e.preventDefault(); logSetMax(512);
+  });
+  $('#logMax10').addEventListener('click', function (e) {
+    e.preventDefault(); logSetMax(10 * 1024);
+  });
+
   $('#btnSaveLogConf').addEventListener('click', function () {
     var msg = $('#logConfMsg');
+    var kb = logMaxKb();
+    if (kb === '') { toast('请填写日志大小上限', 'err'); return; }
     withBusy(function () {
       msg.textContent = '保存中…';
       return api('/logconf', { method: 'PUT', json: {
         level: $('#logLevel').value,
-        max_mb: $('#logMaxMb').value,
+        max_kb: kb,
         keep: $('#logKeep').value
       } }).then(function (d) {
         msg.textContent = '';
         var c = d.conf;
         $('#logLevel').value = c.level;
-        $('#logMaxMb').value = c.max_mb;
+        logSetMax(c.max_kb);
         $('#logKeep').value = c.keep;
         toast('日志设置已保存，约 30 秒内生效', 'ok');
       }).catch(function (e) {

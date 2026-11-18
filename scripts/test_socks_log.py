@@ -400,14 +400,14 @@ P.ensure_dirs()
 P.render_config()
 conf = P.load_log_conf()
 check("默认级别为 info", conf["level"] == "info", conf)
-check("默认 10MB / 5 份", conf["max_mb"] == 10 and conf["keep"] == 5, conf)
+check("默认 10MB / 5 份", conf["max_kb"] == 10240 and conf["keep"] == 5, conf)
 
 y = open(os.path.join(P.SERVER_DIR, "logs", "log4rs.yaml"), encoding="utf-8").read()
 check("默认写进 yaml 的 level=info", "level: info" in y)
-check("默认写进 yaml 的 limit=10 mb", "limit: 10 mb" in y)
+check("默认写进 yaml 的 limit=10 mb（10240KB 整除故用 mb）", "limit: 10 mb" in y)
 check("默认写进 yaml 的 count=5", "count: 5" in y)
 
-c, errs = P.normalize_log_conf("debug", 50, 10)
+c, errs = P.normalize_log_conf("debug", 51200, 10)
 check("合法值通过校验", not errs, errs)
 P.save_log_conf(c)
 y = open(os.path.join(P.SERVER_DIR, "logs", "log4rs.yaml"), encoding="utf-8").read()
@@ -420,21 +420,21 @@ check("大小越界被拒", P.normalize_log_conf(None, 0, None)[1])
 check("份数越界被拒", P.normalize_log_conf(None, None, 999)[1])
 check("非数字被拒", P.normalize_log_conf(None, "abc", None)[1])
 check("只传 level 时其它字段保留",
-      P.normalize_log_conf("warn", None, None)[0]["max_mb"] == 50,
+      P.normalize_log_conf("warn", None, None)[0]["max_kb"] == 51200,
       P.normalize_log_conf("warn", None, None)[0])
 
 # 配置损坏时回落默认
 P.write_file(P.LOG_CONF_FILE, "{ 这不是 json")
 check("配置损坏回落默认", P.load_log_conf()["level"] == "info")
-P.write_file(P.LOG_CONF_FILE, '{"level":"nope","max_mb":99999,"keep":-1}')
+P.write_file(P.LOG_CONF_FILE, '{"level":"nope","max_kb":999999999,"keep":-1}')
 d = P.load_log_conf()
-check("配置非法值被逐项过滤", d == {"level": "info", "max_mb": 10, "keep": 5}, d)
+check("配置非法值被逐项过滤", d == {"level": "info", "max_kb": 10240, "keep": 5}, d)
 
 # 视图含界面需要的元信息
-P.save_log_conf({"level": "debug", "max_mb": 20, "keep": 3})
+P.save_log_conf({"level": "debug", "max_kb": 20480, "keep": 3})
 v = P.log_conf_view()
 check("视图含级别列表", "debug" in v["levels"], v["levels"])
-check("视图含取值范围", v["max_mb_range"] == [1, 1024], v["max_mb_range"])
+check("视图含取值范围", v["max_kb_range"] == [64, 1048576], v["max_kb_range"])
 
 # ===========================================================================
 print("\n[8] trim 不再截断 vnts2.log（面板与核心轮转不再打架）")
@@ -462,8 +462,50 @@ check("无 log4rs 时兜底截断 vnts2.log",
       os.path.getsize(vlog) < 512 * 1024, os.path.getsize(vlog))
 
 # ===========================================================================
-print("\n[9] 客户端 RST 断开不再刷 traceback（原报错来源）")
+print("\n[9] 日志上限支持 KB 档（含 512KB）")
 # ===========================================================================
+# log4rs 的 size 支持 b/kb/kib/mb/gb/tb，且大小写不敏感
+# （源码 size.rs：unit.eq_ignore_ascii_case("kb") -> number * 1024）。
+# 因此 512 KB 可以精确表达，界面按 KB 提交。
+c, errs = P.normalize_log_conf(None, 512, None)
+check("512 KB 被接受", not errs and c["max_kb"] == 512, (errs, c))
+P.save_log_conf(c)
+y = open(os.path.join(P.SERVER_DIR, "logs", "log4rs.yaml"), encoding="utf-8").read()
+check("512KB 写进 yaml 为 '512 kb'（未满 1MB 不换算成 mb）", "limit: 512 kb" in y,
+      [l for l in y.splitlines() if "limit" in l])
+
+# 整 MB 仍写成 mb，便于阅读（与 kb 等价）
+c, _ = P.normalize_log_conf(None, 2048, None)
+P.save_log_conf(c)
+y = open(os.path.join(P.SERVER_DIR, "logs", "log4rs.yaml"), encoding="utf-8").read()
+check("2048KB 写成 '2 mb'", "limit: 2 mb" in y, [l for l in y.splitlines() if "limit" in l])
+
+# 非整 MB 的 KB 一律用 kb
+c, _ = P.normalize_log_conf(None, 1536, None)
+P.save_log_conf(c)
+y = open(os.path.join(P.SERVER_DIR, "logs", "log4rs.yaml"), encoding="utf-8").read()
+check("1536KB 写成 '1536 kb'", "limit: 1536 kb" in y)
+
+# 兼容老配置：只有 max_mb 时应换算为 KB
+P.write_file(P.LOG_CONF_FILE, '{"level":"warn","max_mb":3,"keep":4}')
+old = P.load_log_conf()
+check("老配置 max_mb=3 换算成 max_kb=3072",
+      old["max_kb"] == 3072 and old["level"] == "warn" and old["keep"] == 4, old)
+
+# 越界
+check("低于下限被拒", P.normalize_log_conf(None, 10, None)[1], )
+check("高于上限被拒", P.normalize_log_conf(None, 2 * 1024 * 1024, None)[1])
+check("小数 KB 可四舍五入", P.normalize_log_conf(None, 512.6, None)[0]["max_kb"] == 513)
+check("空串按未填处理（不改动）",
+      P.normalize_log_conf(None, "", None)[0]["max_kb"] == P.load_log_conf()["max_kb"])
+
+# 视图里有 KB 范围与常用档位
+v = P.log_conf_view()
+check("视图提供 512KB 档位", 512 in v["presets_kb"], v["presets_kb"])
+check("视图含 max_kb", "max_kb" in v, list(v.keys())[:8])
+check("视图同时给出 max_mb 便于显示", v["max_mb"] == round(v["max_kb"] / 1024.0, 2), v.get("max_mb"))
+
+print("\n[10] 客户端 RST 断开不再刷 traceback（原报错来源）")
 # 现象：浏览器切路由 / 反代探活后立刻断开时，BaseHTTPRequestHandler 的
 # rfile.readline() 抛 ConnectionResetError，socketserver 把整段 traceback
 # 打到 stderr（进而进日志），把日志刷满。

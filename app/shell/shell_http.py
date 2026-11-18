@@ -383,8 +383,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.ok(P.log_conf_view())
             if method == "PUT":
                 b = self._json_body()
-                conf, errs = P.normalize_log_conf(
-                    b.get("level"), b.get("max_mb"), b.get("keep"))
+                # 兼容两种入参：max_kb（精确）优先，其次 max_mb（换算）
+                kb = b.get("max_kb")
+                if kb is None and b.get("max_mb") is not None:
+                    try:
+                        kb = float(b.get("max_mb")) * 1024
+                    except (TypeError, ValueError):
+                        kb = b.get("max_mb")     # 交给校验报错
+                conf, errs = P.normalize_log_conf(b.get("level"), kb, b.get("keep"))
                 if errs:
                     return self.err("；".join(errs))
                 P.save_log_conf(conf)

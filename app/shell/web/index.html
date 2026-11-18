@@ -150,11 +150,26 @@
       </div>
 
       <div class="panel">
-        <h2>协议开关</h2>
+        <h2>协议开关与端口</h2>
         <label class="chk"><input type="checkbox" id="sTcp"> TCP over TLS</label>
+        <div class="field">
+          <label>TCP 独立端口（留空 = 复用组网服务端口）</label>
+          <input type="number" id="sTcpPort" class="inp" placeholder="留空则复用">
+        </div>
         <label class="chk"><input type="checkbox" id="sQuic"> QUIC</label>
+        <div class="field">
+          <label>QUIC 独立端口（留空 = 复用组网服务端口）</label>
+          <input type="number" id="sQuicPort" class="inp" placeholder="留空则复用">
+        </div>
         <label class="chk"><input type="checkbox" id="sWss"> WSS</label>
-        <div class="hint">三者共用「组网服务端口」；WSS 与 TCP 同端口时自动复用 TLS</div>
+        <div class="field">
+          <label>WSS 独立端口（留空 = 复用组网服务端口）</label>
+          <input type="number" id="sWsPort" class="inp" placeholder="留空则复用">
+        </div>
+        <div class="hint">
+          默认三者<b>复用「组网服务端口」</b>；需要分开监听或避开端口占用时，在此填独立端口。
+          WSS 与 TCP 同端口时自动复用 TLS。
+        </div>
       </div>
 
       <div class="panel">
@@ -269,8 +284,18 @@
           </select>
         </div>
         <div class="field">
-          <label>单个日志文件大小上限（MB）</label>
-          <input type="number" id="logMaxMb" class="inp" placeholder="10" min="1" max="1024">
+          <label>单个日志文件大小上限</label>
+          <input type="number" id="logMax" class="inp" placeholder="10" min="1" step="1">
+          <select id="logMaxUnit" class="inp">
+            <option value="kb">KB</option>
+            <option value="mb" selected>MB</option>
+          </select>
+          <div class="hint">
+            超过即滚动到下一个文件。
+            <a href="#" id="logMax512">用 512 KB</a> ·
+            <a href="#" id="logMax10">用 10 MB</a>
+            （历史上界面只留最近一段日志，看起来像「512K 就覆盖」，现已可自由设定）
+          </div>
         </div>
         <div class="field">
           <label>保留历史文件个数</label>

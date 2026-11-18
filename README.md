@@ -333,9 +333,11 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 | 项 | 默认 | 说明 |
 |---|---|---|
 | 日志级别 | `info` | `trace` / `debug` / `info` / `warn` / `error` |
-| 单文件上限 | 10 MB | 超过即滚动 |
+| 单文件上限 | 10 MB | 64 KB – 1 GB，**可用 KB 或 MB 填**（如 `512 KB`） |
 | 保留份数 | 5 | 滚动后保留的历史文件数 |
 
+- 想限制得小一些（例如只要 512 KB 一个文件），把上限填成 **512 KB** 即可；
+  界面上有「用 512 KB」快捷链接。
 - 配置写进 `server/logs/log4rs.yaml`，由 vnts2 自己读取。该文件里
   `refresh_rate: 30 seconds`，所以**改完约 30 秒自动生效，无需重启核心** ——
   临时开 `debug` 排查问题很方便。
@@ -344,20 +346,46 @@ vnts 官方发版频繁。管理页「核心更新」标签：
   **`vnts2.log` 不由面板截断**，交给核心按上面的策略滚动 —— 否则会把滚动配置架空，
   导致你只能看到"最近一小段"日志。
 
+> 另外，管理页的日志查看框只显示**文件末尾若干行**，避免大文件卡死浏览器。
+> 这是**显示**限制，不代表文件被截断；文件本身是完整的。
+
+## 协议端口
+
+TCP / QUIC / WSS 三种协议**默认复用同一个「组网服务端口」**，开箱即用。
+
+需要分开监听、或要与同机上别的服务错开端口时，在「服务端设置 → 协议开关与端口」
+里为各自填独立端口：
+
+| 配置 | 结果 |
+|---|---|
+| 三者都留空（默认） | 全部监听「组网服务端口」 |
+| 只填 QUIC = 31000 | TCP/WSS 仍旧端口，QUIC 用 31000 |
+| 三者都填 | 各用各的端口 |
+
+规则说明：
+
+- **留空 = 复用**。之后你改「组网服务端口」，留空的协议会**跟着变**；填了独立端口的不会。
+- 独立端口会校验：范围 1–65535、协议之间不能相同、不能与面板端口/控制台端口/
+  服务端互联端口撞车。留空的协议不参与冲突检查。
+- 独立端口的设置单独存在 `server/proto-ports.json`（随导出包迁移）。
+  不写进 `config.toml` 是因为那里只有展开后的端口数字，分不清「用户想固定」
+  和「留空所以复用」—— 会因此算错"改默认端口时谁该跟随"。
+- 改完需重启核心生效（管理页会提示）。
+
 ## 打包与测试
 
 ```bash
 bash scripts/pack.sh            # 产出 fnos-vnts2.fpk
 bash scripts/pack.sh 1.0.1      # 指定版本
 
-python scripts/test_e2e.py            # 端到端（59 项）
+python scripts/test_e2e.py            # 端到端（69 项）
 python scripts/test_import_export.py  # 导入导出专项（28 项）
 python scripts/test_console.py        # 控制台反代与控制台联动（41 项）
 python scripts/test_console_real.py   # 真实前端结构全链路（24 项，素材取自 vnts 二进制）
 python scripts/test_concurrency.py    # 并发与连接复用（8 项）
-python scripts/test_netconf.py        # 下载源与代理：校验/自愈/回退/导出格式（46 项）
+python scripts/test_netconf.py        # 下载源/代理/端口分设：校验、自愈、回退、导出（56 项）
 python scripts/test_dnspeers.py       # 出站互联域名同步：先加后删/自愈/IPv6/401 重登（158 项）
-python scripts/test_socks_log.py      # SOCKS5 协议与中继、日志级别轮转、RST 静默（59 项）
+python scripts/test_socks_log.py      # SOCKS5 协议与中继、日志级别与 KB 档、RST 静默（71 项）
 node   scripts/probe_vite_url.js      # Vite 资源路径改写校验（0 错误）
 ```
 
