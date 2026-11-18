@@ -179,19 +179,38 @@
 
       <div class="panel">
         <h2>服务端互联（可选）</h2>
-        <label class="chk"><input type="checkbox" id="sPeerOn"> 启用服务端互联</label>
+        <label class="chk"><input type="checkbox" id="sPeerOn"> 启用服务端互联（本机入站监听）</label>
         <div class="field">
           <label>互联监听端口（UDP）</label>
           <input type="number" id="sPeerPort" class="inp" placeholder="29873">
         </div>
         <div class="field">
-          <label>其它服务端地址（每行一个）</label>
-          <textarea id="sPeers" class="inp mono" rows="3" placeholder="server1.example.com:29873"></textarea>
-        </div>
-        <div class="field">
           <label>互联验证码</label>
           <input type="text" id="sPeerToken" class="inp" placeholder="多台服务端需一致">
         </div>
+        <p class="muted">此处只控制本机是否接受其它服务端连入。要主动连出到别的服务端，请用下方「出站互联域名」。</p>
+      </div>
+
+      <div class="panel">
+        <h2>出站互联域名</h2>
+        <p class="muted">
+          vnts2 只接受 IP:端口，填域名它解析不了。这里填的域名由管理页定时解析成当前 IP，
+          再自动同步进互联列表 —— 域名 IP 变了会自动换，无需重启核心。
+        </p>
+        <div class="field">
+          <label>其它服务端地址（每行一个，可填域名或 IP）</label>
+          <textarea id="sPeers" class="inp mono" rows="3" placeholder="peer1.example.com:29873"></textarea>
+        </div>
+        <div class="field">
+          <label>轮询间隔（秒，最少 10）</label>
+          <input type="number" id="dnsInterval" class="inp" placeholder="60">
+        </div>
+        <div class="sticky-actions">
+          <button class="btn" id="btnSavePeers">保存并立即同步</button>
+          <button class="btn" id="btnSyncPeers">立即同步一次</button>
+          <span class="muted" id="peersMsg"></span>
+        </div>
+        <div id="dnsPeersStatus" class="muted"></div>
       </div>
 
       <div class="sticky-actions">

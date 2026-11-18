@@ -291,7 +291,6 @@
     $('#sWss').checked = !!s.enable_wss;
     $('#sPeerOn').checked = !!s.enable_peer;
     $('#sPeerPort').value = s.peer_bind_port || 29873;
-    $('#sPeers').value = (s.peer_servers || []).join('\n');
     $('#sPeerToken').value = s.server_token || '';
   }
 
@@ -316,7 +315,6 @@
       enable_wss: $('#sWss').checked,
       enable_peer: $('#sPeerOn').checked,
       peer_bind_port: parseInt($('#sPeerPort').value, 10) || 29873,
-      peer_servers: $('#sPeers').value.split('\n').map(function (x) { return x.trim(); }).filter(Boolean),
       server_token: $('#sPeerToken').value.trim()
     };
   }
@@ -328,6 +326,85 @@
       return api('/settings', { method: 'PUT', json: collectSettings() }).then(function () {
         msg.textContent = '已保存';
         toast('设置已保存', 'ok'); return loadState();
+      }).catch(function (e) {
+        msg.textContent = '';
+        toast(e.message, 'err');
+      });
+    });
+  });
+
+  // ---------------- 出站互联域名（dns-ip.json） ----------------
+  function esc(s) {
+    return String(s === undefined || s === null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function fmtTime(sec) {
+    if (!sec) return '—';
+    var d = new Date(sec * 1000);
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+      ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function renderPeers(st) {
+    var box = $('#dnsPeersStatus');
+    if (!st || !st.records || !st.records.length) {
+      box.innerHTML = '<p>未配置出站互联域名（不轮询）。</p>';
+      return;
+    }
+    var rows = st.records.map(function (r) {
+      var state;
+      if (r.last_error) state = '<span class="bad">异常：' + esc(r.last_error) + '</span>';
+      else if (r.current) state = '<span class="ok">当前 ' + esc(r.current) + '</span>';
+      else state = '<span class="muted">等待同步</span>';
+      return '<tr><td class="mono">' + esc(r.addr) + '</td><td>' + state + '</td>' +
+        '<td class="muted">' + (r.last_sync ? fmtTime(r.last_sync) : '—') + '</td></tr>';
+    }).join('');
+    box.innerHTML = '<p class="muted">轮询间隔 ' + st.interval + ' 秒 · 共 ' +
+      st.count + ' 条</p><table class="tbl"><thead><tr>' +
+      '<th>配置的域名</th><th>状态</th><th>上次同步</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+
+  function loadPeers() {
+    return api('/dns-peers').then(function (st) {
+      $('#sPeers').value = (st.records || []).map(function (r) {
+        return r.addr;
+      }).join('\n');
+      $('#dnsInterval').value = st.interval || 60;
+      renderPeers(st);
+    }).catch(function (e) { toast(e.message, 'err'); });
+  }
+
+  $('#btnSavePeers').addEventListener('click', function () {
+    var msg = $('#peersMsg');
+    withBusy(function () {
+      msg.textContent = '保存中…';
+      return api('/dns-peers', { method: 'PUT', json: {
+        peers: $('#sPeers').value,
+        interval: $('#dnsInterval').value
+      } }).then(function (d) {
+        msg.textContent = '';
+        renderPeers(d.status);
+        toast('已保存并同步', 'ok');
+        return loadState();
+      }).catch(function (e) {
+        msg.textContent = '';
+        toast(e.message, 'err');
+      });
+    });
+  });
+
+  $('#btnSyncPeers').addEventListener('click', function () {
+    var msg = $('#peersMsg');
+    withBusy(function () {
+      msg.textContent = '同步中…';
+      return api('/dns-peers/sync', { method: 'POST', json: {} }).then(function (d) {
+        msg.textContent = '';
+        renderPeers(d.status);
+        toast(d.msg || '已同步', d.ok ? 'ok' : 'err');
       }).catch(function (e) {
         msg.textContent = '';
         toast(e.message, 'err');
@@ -598,6 +675,7 @@
     loadState().catch(function (e) { toast('加载状态失败：' + e.message, 'err'); });
     loadPorts();
     api('/settings').then(fillSettings).catch(function () {});
+    loadPeers();
     // 镜像/代理现值统一从 /state 取（见下），无需再单独拉 /mirror、/proxy
     // 拉取镜像/代理现值
     api('/state').then(function (st) {

@@ -375,6 +375,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/test-connection":
             return self._test_connection()
 
+        if path == "/dns-peers":
+            if method == "GET":
+                return self.ok(P.dns_peers_status())
+            if method == "PUT":
+                body = self._json_body()
+                res = P.set_dns_peers(body.get("peers", ""), body.get("interval"))
+                if not res.get("ok"):
+                    return self.err("；".join(res.get("errors", [])) or "保存失败")
+                return self.ok({"saved": True, "status": res.get("status"),
+                                "sync": res.get("sync", ""),
+                                "actions": res.get("actions", [])})
+            return self.err("方法不允许", 405)
+
+        if path == "/dns-peers/sync":
+            if method != "POST":
+                return self.err("方法不允许", 405)
+            res = P.sync_dns_peers(log_prefix="域名同步（手动）")
+            if res.get("skipped"):
+                return self.ok({"ok": True, "msg": "清单为空，无需同步",
+                                "status": P.dns_peers_status()})
+            return self.ok({"ok": res.get("ok"), "msg": res.get("error") or "已同步",
+                            "actions": res.get("actions", []),
+                            "status": P.dns_peers_status()})
+
         if path == "/core/check":
             if not P.arch_triple():
                 return self.err("当前架构 %s 无官方预编译包" % S.machine())

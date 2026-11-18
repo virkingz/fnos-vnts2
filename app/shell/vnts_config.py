@@ -56,7 +56,9 @@ DEFAULTS = {
     # 服务端互联（可选）
     "enable_peer": False,
     "peer_bind_port": 29873,
-    "peer_servers": [],         # ["host:29873"]
+    # peer_servers 保留在建里只为兼容旧调用方，**渲染时恒写空数组**。
+    # 出站互联的真实清单在 server/dns-ip.json（见 dns_peers.py）。
+    "peer_servers": [],
     "server_token": "",
     # 订阅/数据面（可选，供服务端下发配置）
     "subscription_server": "",
@@ -204,6 +206,13 @@ def validate(s):
     for code in (s.get("group_types") or {}):
         if code in (s.get("custom_nets") or {}):
             pass  # 允许同时存在
+    # 出站互联写入 SQLite，数据库只在 persistence=true 时初始化：
+    # 关掉持久化后 add/remove_peer_server 会直接失败，域名轮询无从生效。
+    # 因此只要配了出站互联域名，就必须保持持久化开启。
+    # （peer_servers 由 dns_peers 托管，这里用 dns_hosts 传入的清单判断。）
+    hosts = s.get("dns_hosts") or []
+    if hosts and not s.get("persistence", True):
+        errs.append("配置了出站互联域名时必须开启「数据持久化」（互联记录存在数据库中）")
     return errs
 
 
@@ -259,14 +268,19 @@ def render_config_toml(s, service_port, console_port):
     lines.append("# 服务端互联配置（可选）")
     if s.get("enable_peer"):
         lines.append('server_quic_bind = "%s:%d"' % (ip, int(s.get("peer_bind_port", 29873))))
-        peers = s.get("peer_servers") or []
-        lines.append("peer_servers = %s" % _toml_list(peers))
+        # 🔴 peer_servers 恒为空数组，**绝不写域名**：
+        #    vnts2 用 `peer_addr.parse::<SocketAddr>()` 解析该字段，
+        #    只接受字面 IP:port，写域名会每 3~10 秒无限重试并刷错误日志。
+        #    出站互联改由管理页定时解析域名后经控制台 API 写入数据库
+        #    （见 dns_peers.py），清单存在 server/dns-ip.json。
+        lines.append("# 出站互联地址由管理页按域名自动同步（见 dns-ip.json），此处恒为空")
+        lines.append("peer_servers = []")
         tok = str(s.get("server_token") or "")
         if tok:
             lines.append("server_token = %s" % _toml_str(tok))
     else:
         lines.append('# server_quic_bind = "[::]:29873"')
-        lines.append('# peer_servers = ["server1.example.com:29873"]')
+        lines.append('# peer_servers = []   # 出站互联请在管理页填写域名')
         lines.append('# server_token = "your-secret-token"')
     lines.append("")
 
@@ -505,10 +519,14 @@ def _apply_toml(s, t):
     if "server_quic_bind" in t:
         s["enable_peer"] = True
         s["peer_bind_port"] = _port_of(t["server_quic_bind"]) or s.get("peer_bind_port", 29873)
-        s["peer_servers"] = t.get("peer_servers", s.get("peer_servers", []))
         s["server_token"] = t.get("server_token", "")
     else:
         s["enable_peer"] = False
+
+    # peer_servers 不再是配置项：即便历史 config.toml 里残留域名，也不回灌到
+    # 界面（由 dns-ip.json 托管出站互联）。这里显式清空，避免旧值复活后
+    # 被 render 写回配置，重新踩「域名写进配置必然连不上」的坑。
+    s["peer_servers"] = []
 
     tables = t.get("__tables__", {})
     if "custom_nets" in tables:

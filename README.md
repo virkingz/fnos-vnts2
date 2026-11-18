@@ -234,6 +234,38 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 > 架构映射：`x86_64→x86_64-unknown-linux-musl`，
 > `aarch64→aarch64-unknown-linux-musl`，`armv7l→armv7-unknown-linux-musleabihf`。
 
+## 出站互联（域名自动跟随 IP）
+
+多台 vnts2 组网互连时，需要填「其它服务端地址」。**vnts2 只接受字面
+`IP:端口`** —— 它用 `SocketAddr` 解析该字段，写域名会在解析这步直接失败，
+然后每 3~10 秒无限重试，日志一直刷错误。
+
+本插件因此不把地址写进 vnts2 配置，改由管理页托管：
+
+```
+管理页填域名  →  定时解析成当前 IP  →  经控制台 API 增删互联记录  →  结果存 dns-ip.json
+```
+
+- **IP 变了会自动换成新的**，无需重启核心（API 增删即时生效）。
+- 增删顺序恒为**先加新、再删旧**，中间不会出现「旧的没了、新的没加上」的空窗。
+- 只删自己名下的地址；你在控制台手工加的记录不会被碰。
+- 清单为空时**完全不轮询**，不发任何网络请求。
+- 核心启动后会自动补同步一次（核心没运行时互联记录会全断）。
+
+配置项在管理页「出站互联域名」：
+
+| 项 | 说明 |
+|---|---|
+| 其它服务端地址 | 每行一个，可填域名或 IP；支持 IPv6（写作 `[2001:db8::1]:29873`） |
+| 轮询间隔 | 秒，默认 60，最少 10 |
+
+一个域名解析出多个 IP 时**只取第一个**（互联列表按精确字符串管理，多 IP 会让列表难维护）。
+
+> **前提**：互联记录存在 SQLite 里，因此必须先开启「数据持久化」。
+> 关掉持久化又配了域名，保存时会被拦下并提示。
+
+`server/dns-ip.json` 会随导出包一起走，迁移机器时域名清单不丢。
+
 ## 下载源与网络代理
 
 「下载源与代理」里有**两种互相独立**的出网配置，可只配其一，也可同时使用：
@@ -263,12 +295,14 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 bash scripts/pack.sh            # 产出 fnos-vnts2.fpk
 bash scripts/pack.sh 1.0.1      # 指定版本
 
-python scripts/test_e2e.py            # 端到端（31 项）
+python scripts/test_e2e.py            # 端到端（46 项）
 python scripts/test_import_export.py  # 导入导出专项（21 项）
 python scripts/test_console.py        # 控制台反代与控制台联动（41 项）
 python scripts/test_console_real.py   # 真实前端结构全链路（24 项，素材取自 vnts 二进制）
 python scripts/test_concurrency.py    # 并发与连接复用（8 项）
 python scripts/test_netconf.py        # 下载源与代理：校验/自愈/回退/导出格式（43 项）
+python scripts/test_dnspeers.py       # 出站互联域名同步：先加后删/自愈/IPv6/401 重登（103 项）
+node   scripts/probe_vite_url.js      # Vite 资源路径改写校验（0 错误）
 ```
 
 > **Windows 打包注意**：`pack.sh` 会把 `cmd/*` 强制设为 755 并转 LF，跨平台更稳。
@@ -307,6 +341,8 @@ $TRIM_PKGVAR/            # /vol{n}/@appdata/vnts-nas
 ├── server/               # vnts2 工作目录（CWD）
 │   ├── config.toml       # 服务端配置（唯一配置文件，界面直接读写）
 │   ├── network_control.db# 网络与设备记录（SQLite）
+│   ├── dns-ip.json       # 出站互联域名清单 + 最近解析结果
+│   ├── mirror / proxy    # 下载镜像前缀 / 网络代理
 │   └── logs/log4rs.yaml  # 仅日志配置，无日志数据
 ├── cache/                # 下载缓存 + 回滚备份 + 导入前备份
 ├── log/                  # 默认日志目录（可用 LOG_DIR 改到别处）

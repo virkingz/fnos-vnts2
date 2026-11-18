@@ -30,6 +30,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import dns_peers as DP  # noqa: E402
 import vnts_config as C  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,8 @@ PORT_FILE = os.path.join(PKGVAR, "ports.env")
 LOGDIR_FILE = os.path.join(PKGVAR, "logdir")
 MIRROR_FILE = os.path.join(SERVER_DIR, "mirror")
 PROXY_FILE = os.path.join(SERVER_DIR, "proxy")
+# 出站互联域名清单 + 解析结果（与 mirror/proxy 同级，导出包自动带上）
+DNS_PEERS_FILE = os.path.join(SERVER_DIR, "dns-ip.json")
 SOCK_PATH = os.path.join(APPDEST, "app.sock")
 
 CORE_BIN = os.path.join(BIN_DIR, "vnts2")
@@ -174,6 +177,191 @@ def heal_legacy_conf():
         return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# 出站互联域名同步（dns-ip.json 是唯一真源）
+#
+# vnts2 的 peer_servers 只认字面 IP:port，写域名必然连不上（见 dns_peers.py
+# 顶部说明）。因此 config.toml 里 peer_servers 恒为空，出站互联改为：
+#   管理页定时解析域名 → 经控制台 API 增删 → 记录写回 dns-ip.json
+# 增删即时生效，无需重启核心。
+# ---------------------------------------------------------------------------
+_dns_lock = threading.RLock()
+_dns_stop = threading.Event()
+
+
+def load_dns_doc():
+    """读 dns-ip.json（缺失/损坏均返回默认值）。"""
+    return DP.load_doc(DNS_PEERS_FILE)
+
+
+def save_dns_doc(doc):
+    DP.save_doc(DNS_PEERS_FILE, doc)
+
+
+def dns_peers_status():
+    """界面用：清单 + 每条记录的解析状态。"""
+    return DP.status_view(load_dns_doc())
+
+
+def _console_base():
+    """控制台 API 的本地入口（仅回环，由本壳反代对外）。"""
+    _, console_port = C.read_ports(PORT_FILE)
+    return "http://127.0.0.1:%d" % console_port
+
+
+def _console_client():
+    """按当前 config.toml 里的管理员账号构造控制台客户端。"""
+    s = C.load_settings(SERVER_DIR)
+    return DP.ConsoleClient(
+        _console_base(),
+        str(s.get("username") or "admin"),
+        str(s.get("password") or "admin"),
+    )
+
+
+def sync_dns_peers(once=False, log_prefix="域名同步"):
+    """执行一轮域名 → IP 同步。
+
+    返回 {"ok":bool, "actions":[...], "error":str}。
+    清单为空则**不做任何网络动作**（这是「为空不轮询」的落点）。
+    """
+    doc = load_dns_doc()
+    if not doc.get("records"):
+        return {"ok": True, "actions": [], "skipped": True, "error": ""}
+    if not core_running():
+        return {"ok": False, "actions": [], "error": "核心未运行，暂不同步"}
+
+    with _dns_lock:
+        # 重新读一次：可能刚被界面改过
+        doc = load_dns_doc()
+        if not doc.get("records"):
+            return {"ok": True, "actions": [], "skipped": True, "error": ""}
+        try:
+            client = _console_client()
+            actions = DP.sync_once(doc, client, log=log)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "actions": [], "error": "同步异常: %s" % e}
+        try:
+            save_dns_doc(doc)
+        except OSError as e:
+            return {"ok": False, "actions": actions, "error": "写入 dns-ip.json 失败: %s" % e}
+
+    changed = [a for a in actions if a.get("action") in ("add", "del")]
+    errors = [a for a in actions if a.get("action") == "error"]
+    if changed or errors:
+        log("%s：变更 %d 项，异常 %d 项" % (log_prefix, len(changed), len(errors)))
+    return {"ok": not errors, "actions": actions, "error": ""}
+
+
+def set_dns_peers(hosts, interval=None):
+    """保存域名清单（界面入口）。保存后立刻同步一次。
+
+    hosts 可以是多行文本、列表或逗号分隔串。
+    注意 merge_records：同名域名的解析状态会被保留，避免无谓的删了又加。
+    """
+    recs, errs = DP.parse_lines(hosts)
+    if errs:
+        return {"ok": False, "errors": errs}
+
+    if interval is not None:
+        iv, ierr = DP.normalize_interval(interval)
+        if ierr:
+            return {"ok": False, "errors": [ierr]}
+    else:
+        iv = load_dns_doc().get("interval", DP.DEFAULT_INTERVAL)
+
+    # 配了出站互联域名就必须开持久化（互联记录存在 SQLite 里）
+    if recs and not C.load_settings(SERVER_DIR).get("persistence", True):
+        return {"ok": False, "errors": [
+            "配置了出站互联域名时必须开启「数据持久化」（互联记录存在数据库中）"]}
+
+    with _dns_lock:
+        old = load_dns_doc()
+        doc = {"version": 1, "interval": iv,
+               "records": DP.merge_records(old.get("records") or [], recs)}
+        ensure_dirs()
+        save_dns_doc(doc)
+
+    res = sync_dns_peers(log_prefix="域名同步（保存后）")
+    return {"ok": True, "status": dns_peers_status(),
+            "sync": res.get("error") or "已同步", "actions": res.get("actions") or []}
+
+
+def dns_sync_loop(stop_event):
+    """后台轮询线程。清单为空时**空转等待**，不做网络请求。"""
+    while not stop_event.is_set():
+        interval = DP.DEFAULT_INTERVAL
+        try:
+            doc = load_dns_doc()
+            interval = doc.get("interval") or DP.DEFAULT_INTERVAL
+            if doc.get("records"):
+                sync_dns_peers()
+        except Exception as e:  # noqa: BLE001
+            log("域名轮询异常: %s" % e)
+        # 用 Event.wait 替代 sleep，退出时能立刻醒来
+        try:
+            iv = max(DP.MIN_INTERVAL, int(interval))
+        except (TypeError, ValueError):
+            iv = DP.DEFAULT_INTERVAL
+        stop_event.wait(iv)
+
+
+def _migrate_legacy_peer_domains():
+    """把历史 config.toml 里的 peer_servers 域名搬到 dns-ip.json。
+
+    老版本允许在配置里直接写出站互联地址。由于核心只认 IP:port，
+    这些条目（无论域名还是裸 IP）在库里都是「连不上却一直重试」的死记录。
+    迁移做法：能解析出 host:port 的都搬进 dns-ip.json 清单，
+    然后重渲染 config.toml 把 peer_servers 清空 —— 记录不会丢，
+    且下次同步就会自动把它换成当前正确的 IP。
+    """
+    if not os.path.isfile(CONFIG_TOML):
+        return False
+    try:
+        text = read_file(CONFIG_TOML)
+    except OSError:
+        return False
+    m = re.search(r"^\s*peer_servers\s*=\s*\[(.*?)\]", text, re.M | re.S)
+    if not m:
+        return False
+    raw = m.group(1).strip()
+    if not raw:
+        return False
+    items = re.findall(r'"((?:[^"\\]|\\.)*)"', raw)
+    hosts = [i.replace('\\"', '"').replace("\\\\", "\\") for i in items]
+    if not hosts:
+        return False
+
+    # 只搬「还没进清单」的条目，避免覆盖已有解析状态
+    doc = load_dns_doc()
+    existing = set()
+    for r in doc.get("records") or []:
+        existing.add("%s:%s" % (str(r.get("host", "")).lower(), r.get("port")))
+    new_recs, errs = DP.parse_lines(hosts)
+    add = []
+    for r in new_recs:
+        key = "%s:%s" % (r["host"].lower(), r["port"])
+        if key not in existing:
+            add.append(r)
+    for e in errs:
+        log("历史互联地址无法迁移：%s" % e)
+
+    if add:
+        doc["records"] = (doc.get("records") or []) + add
+        try:
+            save_dns_doc(doc)
+            log("已把 %d 个历史互联地址迁入 dns-ip.json" % len(add))
+        except OSError as e:
+            log("迁移 dns-ip.json 失败: %s" % e)
+            return False
+    # 清空配置里的记录（重渲染即恒写 []）
+    try:
+        render_config()
+    except Exception as e:  # noqa: BLE001
+        log("迁移后重渲染 config.toml 失败: %s" % e)
+    return bool(add)
 
 
 def now():
@@ -1022,6 +1210,7 @@ EXPORT_MARKER = "vnts-nas-export.json"
 EXPORT_FILES = [
     ("config.toml", "server/config.toml"),
     ("network_control.db", "server/network_control.db"),
+    ("dns-ip.json", "server/dns-ip.json"),
     ("mirror", "server/mirror"),
     ("proxy", "server/proxy"),
     ("cert.pem", "server/cert.pem"),
@@ -1239,3 +1428,9 @@ def bootstrap():
     log("bootstrap: %s" % msg)
     if ok:
         mark_autostart(True)
+        # 核心刚起来，立刻补一次域名同步：不等下一个轮询周期
+        # （核心未运行时互联记录会全断，起来后要马上恢复）
+        try:
+            sync_dns_peers(log_prefix="域名同步（核心启动后）")
+        except Exception as e:  # noqa: BLE001
+            log("核心启动后同步域名失败: %s" % e)

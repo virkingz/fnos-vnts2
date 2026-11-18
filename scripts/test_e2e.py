@@ -160,11 +160,75 @@ def main():
         l4 = open(os.path.join(var, "server", "logs", "log4rs.yaml"), encoding="utf-8").read()
         check("log4rs 已跟随更新", newlog.replace("\\", "/") in l4.replace("\\", "/"))
 
-        print("\n[9] 控制台反代（核心未运行）")
+        print("\n[9] 出站互联域名接口")
+        c, b = get(url + "/panel-api/dns-peers", {"X-Panel-Token": token})
+        st = json.loads(b.decode())["data"]
+        check("GET 返回清单结构", "interval" in st and "records" in st,
+              list(st.keys()))
+        check("初始清单为空", st["count"] == 0 and st["enabled"] is False)
+
+        # 非法地址必须被拦下，且不落盘
+        c, b = get(url + "/panel-api/dns-peers",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"peers": "bad-no-port"}).encode())
+        check("非法地址被拒", c == 400, b[:120])
+
+        c, b = get(url + "/panel-api/dns-peers",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"peers": "peer1.example.com:29873",
+                                      "interval": 5}).encode())
+        check("间隔越界被拒", c == 400 and "10" in b.decode("utf-8", "replace"), b[:120])
+
+        # 合法保存（核心未运行 → 同步会跳过，但清单要落盘）
+        c, b = get(url + "/panel-api/dns-peers",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"peers": "peer1.example.com:29873\na.example.com:29874",
+                                      "interval": 120}).encode())
+        check("保存域名清单成功", c == 200, b[:160])
+        st = json.loads(b.decode())["data"]["status"]
+        check("清单条数为 2", st["count"] == 2, st)
+        check("间隔已保存", st["interval"] == 120, st["interval"])
+        check("域名未写进 config.toml",
+              "peer1.example.com" not in
+              open(os.path.join(var, "server", "config.toml"), encoding="utf-8").read())
+        check("config.toml 里 peer_servers 为空",
+              "peer_servers = []" in
+              open(os.path.join(var, "server", "config.toml"), encoding="utf-8").read())
+
+        dns_json = os.path.join(var, "server", "dns-ip.json")
+        check("dns-ip.json 已落盘", os.path.isfile(dns_json))
+        saved = json.load(open(dns_json, encoding="utf-8"))
+        check("落盘的间隔正确", saved["interval"] == 120)
+        check("落盘两条记录", len(saved["records"]) == 2)
+
+        # 导出包必须带上 dns-ip.json
+        c, b = get(url + "/panel-api/config/export", {"X-Panel-Token": token})
+        import io as _io
+        import zipfile as _zip
+        names = _zip.ZipFile(_io.BytesIO(b)).namelist()
+        check("导出包含 dns-ip.json", "server/dns-ip.json" in names, names)
+
+        # 核心未运行时手动同步应给出明确提示而不是崩
+        c, b = get(url + "/panel-api/dns-peers/sync",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "POST", b"{}")
+        j = json.loads(b.decode())
+        check("核心未运行时同步有明确反馈",
+              c == 200 and j["data"]["ok"] is False, b[:160])
+
+        # 清空清单 → 恢复「不轮询」状态
+        c, b = get(url + "/panel-api/dns-peers",
+                   {"X-Panel-Token": token, "Content-Type": "application/json"},
+                   "PUT", json.dumps({"peers": ""}).encode())
+        st = json.loads(b.decode())["data"]["status"]
+        check("清空后 enabled 为假", st["count"] == 0 and st["enabled"] is False)
+
+        print("\n[10] 控制台反代（核心未运行）")
         c, b = get(url + "/console/")
         check("未运行时返回提示", c == 502 and ("控制台未运行" in b.decode("utf-8", "replace")), c)
 
-        print("\n[10] 自检")
+        print("\n[11] 自检")
+
         c, b = get(url + "/panel-api/selfcheck", {"X-Panel-Token": token})
         check("自检可调用", c == 200, c)
 
