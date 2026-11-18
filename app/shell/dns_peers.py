@@ -471,18 +471,29 @@ class ConsoleClient(object):
 # 单轮同步（本模块的核心，全部纯度可测）
 # ---------------------------------------------------------------------------
 def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
-    """对文档里的每条记录做一轮同步，**原地修改 doc**。
+    """按配置清单与核心出站列表做一轮**完全对账**，原地修改 doc。
 
     返回 actions 列表（供界面与日志展示）。每项形如：
         {"host":.., "action":"add"|"del"|"keep"|"error", "addr":.., "msg":..}
 
-    设计要点：
-      - 先解析。解析失败 → 该条记 error，**旧地址一律不动**。
-      - 再查核心实际 outbound 列表（每轮都查，实现自愈：
-        即使有人在控制台手工删掉我们的记录，下一轮自动补回）。
-      - 想要的地址已在列表 → keep，不做任何写操作。
-      - 需要变更 → **先 add 新地址**；确认出现在列表里后，**再 del 旧地址**。
-      - 只删 rec["current"] 里记录的、且确实存在于列表中的地址。
+    对账口径：**以 dns-ip.json 清单为唯一真源**。核心出站列表里凡是
+    不在清单中的地址，一律删除 —— 包括：
+      - 我们上一次同步留下的旧 IP；
+      - 先加新、尚未来得及删旧就重启核心而残留的多余记录；
+      - 在控制台手工添加的地址。
+
+    这样做的好处是「幂等收敛」：无论中间被打断多少次，最终状态一定
+    等于清单所要求的状态，不会越积越多。
+
+    分两阶段，顺序不可颠倒：
+
+      阶段一（补齐 + 换旧）：逐条解析域名 → 确保目标地址存在 → 删掉该条的旧地址。
+        解析失败时**该条原地不动**（保留旧地址），避免一次 DNS 抖动断掉互联。
+      阶段二（清理残留）：删除出站列表里所有不属于清单的地址。
+        放在最后是为了不误删「本轮刚加的新地址还没确认就清理」。
+
+    安全约束：只处理 outbound（核心主动外连的）地址，绝不碰 inbound
+    （别的服务端连进来的），那些不是我们的管辖范围。
     """
     now = int(now if now is not None else time.time())
     actions = []
@@ -503,23 +514,42 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
                             "addr": "", "msg": err})
         return actions
 
+    # 清单要求的目标地址集合。
+    #
+    # 清理阶段的安全性依据：它只删「不在 wanted 里的出站地址」，而每个我们
+    # 加过的地址必然属于下列之一，因而都受保护：
+    #   - 解析成功 → 目标地址进 wanted，旧地址由阶段一亲自删除；
+    #   - 解析失败 → 其 current 进 wanted，不会因一次 DNS 抖动被清掉。
+    # 所以即便存在永久解析失败的条目，清理也只影响真正的残留记录。
+    wanted = set()
+    resolved = {}          # id(rec) -> (want, cur)
     for rec in records:
         host = rec.get("host") or ""
         want, rerr = desired_addr(rec, _getaddrinfo=_getaddrinfo)
+        cur = (rec.get("current") or "").strip()
         if rerr:
-            # 解析失败：保留旧地址，只记错误
+            if cur:
+                wanted.add(cur)      # 解析失败：保留旧地址，且不视为残留
+            continue
+        wanted.add(want)
+        resolved[id(rec)] = (want, cur)
+
+    # ---- 阶段一：补齐目标地址，并删掉该条的旧地址 ----
+    for rec in records:
+        host = rec.get("host") or ""
+        pair = resolved.get(id(rec))
+        if pair is None:
+            rerr = desired_addr(rec, _getaddrinfo=_getaddrinfo)[1]
             rec["last_error"] = rerr
             actions.append({"host": host, "action": "error",
                             "addr": rec.get("current") or "", "msg": rerr})
             _log("域名解析失败，保留原地址：%s —— %s" % (host, rerr))
             continue
 
-        cur = (rec.get("current") or "").strip()
+        want, cur = pair
 
-        # 判定标准是「目标地址是否真的在核心的外连列表里」，而不是
-        # 「记录里的 current 是否等于目标」。这样能同时覆盖两种情况：
-        #   a) IP 刚变化，需要把新地址加进去；
-        #   b) 地址没变，但记录被人在控制台手工删掉了 → 自动补回（自愈）。
+        # 判定基准是「核心实际列表」，而非记录里的 current。
+        # 这样即使记录被人在控制台删掉，也能自动补回（自愈）。
         if want not in out_addrs:
             ok, aerr = client.add_peer(want)
             if not ok:
@@ -548,7 +578,7 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
                 actions.append({"host": host, "action": "del", "addr": cur, "msg": ""})
                 _log("已移除旧互联地址：%s（%s）" % (cur, host))
             else:
-                # 删除失败不算致命：新地址已在，下一轮会再试
+                # 删除失败不算致命：新地址已在，阶段二/下一轮会再试
                 rec["last_error"] = derr
                 actions.append({"host": host, "action": "error",
                                 "addr": cur, "msg": derr})
@@ -558,6 +588,33 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
         rec["last_sync"] = now
         rec["last_ok"] = now
         rec["last_error"] = ""
+
+    # ---- 阶段二：清理出站列表里所有不属于清单的残留 ----
+    # 覆盖「先加后删中途重启」留下的多余记录，以及在控制台手工加的地址。
+    #
+    # protected 同时收纳「每条记录的 current」：阶段一在添加失败时会跳过
+    # 删除旧地址，若这里不保护它，清理就会把旧地址删掉 —— 那正是
+    # 「加失败绝不删旧」要防的事故。真正的残留（例如上一轮已把 current
+    # 更新为新 IP 后遗留的旧 IP）不在任何记录的 current 里，仍会被清掉。
+    protected = set(wanted)
+    for rec in records:
+        c = (rec.get("current") or "").strip()
+        if c:
+            protected.add(c)
+
+    for addr in list(out_addrs):
+        if addr in protected:
+            continue
+        ok, derr = client.del_peer(addr)
+        if ok:
+            out_addrs.remove(addr)
+            actions.append({"host": "", "action": "del", "addr": addr,
+                            "msg": "不在配置清单中，已清理"})
+            _log("清理多余互联地址：%s（不在配置清单中）" % addr)
+        else:
+            actions.append({"host": "", "action": "error", "addr": addr,
+                            "msg": derr})
+            _log("清理多余地址 %s 失败：%s" % (addr, derr))
 
     return actions
 

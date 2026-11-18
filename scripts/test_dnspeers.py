@@ -225,19 +225,52 @@ print("\n[9] 同步：添加失败 → 绝不删旧")
 d = {"records": [rec(cur="9.9.9.9:29873")]}
 c = StubClient(["9.9.9.9:29873"], fail_add=True)
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
-check("只尝试了 add", c.calls == [("add", "1.2.3.4:29873")], c.calls)
-check("旧地址仍在（互联未断）", "9.9.9.9:29873" in c.addrs and d["records"][0]["current"] == "9.9.9.9:29873")
+check("尝试过 add", ("add", "1.2.3.4:29873") in c.calls, c.calls)
+check("旧地址仍在（互联未断）",
+      "9.9.9.9:29873" in c.addrs and d["records"][0]["current"] == "9.9.9.9:29873")
 check("记录了错误", bool(d["records"][0]["last_error"]))
 
 # ===========================================================================
-print("\n[10] 同步：只删自己名下的地址")
+print("\n[10] 同步：以清单为准，清理一切多余地址")
 # ===========================================================================
+# 语义：dns-ip.json 是唯一真源。核心出站列表里凡不在清单中的地址都要清掉，
+# 包括在控制台手工添加的 —— 这是「先加后删中途重启留下多余记录」的收敛手段。
 d = {"records": [rec(cur="9.9.9.9:29873")]}
-c = StubClient(["9.9.9.9:29873", "8.8.8.8:9999"])   # 后者是用户手工加的
+c = StubClient(["9.9.9.9:29873", "8.8.8.8:9999"])   # 后者是控制台手工加的
 D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
-check("手工加的地址未被触碰", "8.8.8.8:9999" in c.addrs, c.addrs)
-check("自己的旧地址已替换", "9.9.9.9:29873" not in c.addrs)
-check("新地址已加入", "1.2.3.4:29873" in c.addrs)
+check("最终只剩清单要求的地址", c.addrs == ["1.2.3.4:29873"], c.addrs)
+check("手工加的地址被清理", "8.8.8.8:9999" not in c.addrs)
+check("自己的旧地址被替换", "9.9.9.9:29873" not in c.addrs)
+
+# 场景：上一轮「已加新、未删旧」就重启核心 → 旧 IP 残留在列表里
+d = {"records": [rec(cur="1.2.3.4:29873")]}          # 记录里已是新 IP
+c = StubClient(["1.2.3.4:29873", "9.9.9.9:29873"])   # 旧 IP 还赖着
+D.sync_once(d, c, _getaddrinfo=gai_map({"p.example.com": "1.2.3.4"}))
+check("残留的旧 IP 被清理（核心重启后的收敛）",
+      c.addrs == ["1.2.3.4:29873"], c.addrs)
+check("清理时不会重复 add 目标地址",
+      [x for x in c.calls if x[0] == "add"] == [], c.calls)
+
+# 场景：清单里两条域名，核心里有第三条 → 只清第三条
+d = {"records": [rec("a.com", cur="1.1.1.1:1"), rec("b.com", cur="2.2.2.2:2")]}
+d["records"][0]["port"] = 1
+d["records"][1]["port"] = 2
+c = StubClient(["1.1.1.1:1", "2.2.2.2:2", "7.7.7.7:7"])
+D.sync_once(d, c, _getaddrinfo=gai_map({"a.com": "1.1.1.1", "b.com": "2.2.2.2"}))
+check("只清理不在清单中的那条",
+      sorted(c.addrs) == ["1.1.1.1:1", "2.2.2.2:2"], c.addrs)
+check("清理动作被记录",
+      any(a["action"] == "del" and a["addr"] == "7.7.7.7:7" for a in
+          D.sync_once({"records": [rec("a.com", cur="1.1.1.1:1")]},
+                      StubClient(["1.1.1.1:1", "7.7.7.7:7"]),
+                      _getaddrinfo=gai_map({"a.com": "1.1.1.1"}))))
+
+# 场景：域名解析失败时，其旧地址必须被保护，不能当残留清掉
+d = {"records": [rec(cur="9.9.9.9:29873")]}
+c = StubClient(["9.9.9.9:29873", "7.7.7.7:7"])
+D.sync_once(d, c, _getaddrinfo=gai_map({}))          # 解析失败
+check("解析失败的旧地址受保护", "9.9.9.9:29873" in c.addrs, c.addrs)
+check("但无关残留仍被清理", "7.7.7.7:7" not in c.addrs, c.addrs)
 
 # ===========================================================================
 print("\n[11] 同步：自愈（记录被手工删除后自动补回）")
