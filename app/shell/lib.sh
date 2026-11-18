@@ -448,7 +448,7 @@ vnt_shell_port_up() {
     vnt_load_ports
     local port="${PANEL_PORT:-$PANEL_PORT_DEFAULT}"
     if command -v curl >/dev/null 2>&1; then
-        curl -sf --max-time 2 "http://127.0.0.1:${port}/api/health" >/dev/null 2>&1 && return 0
+        curl -sf --max-time 2 "http://127.0.0.1:${port}/panel-api/health" >/dev/null 2>&1 && return 0
     fi
     vnt_port_in_use "$port"
 }

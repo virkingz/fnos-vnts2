@@ -249,6 +249,35 @@ def main():
           C.validate_proto_ports(c4, reserved=[19098], reserved_names=["面板端口"]))
     check("留空不参与冲突检查", not C.validate_proto_ports(dict(base)))
 
+    # ------------------------------------------------------------------
+    print("\n[?] 插件（fpk）与 Docker 的启动一致性")
+    # ------------------------------------------------------------------
+    # 两个真实故障（都踩过，且症状都是「装了打不开」）：
+    #   1) fpk 启动时没设 PANEL_BIND → 后端默认绑 127.0.0.1 →
+    #      局域网/飞牛桌面访问不到，只有本机能开。
+    #      Docker 的 entrypoint 设了 0.0.0.0，所以 Docker 侧正常。
+    #   2) lib.sh 的就绪探测打的是 /api/health，真实路由是
+    #      /panel-api/health → curl 永远失败，只能退化成「端口被占用」判断。
+    root = os.path.join(HERE, "..")
+    main_sh = open(os.path.join(root, "cmd", "main"), encoding="utf-8").read()
+    check("fpk 启动显式设置 PANEL_BIND", "PANEL_BIND=" in main_sh,
+          [l.strip() for l in main_sh.splitlines() if "PANEL_BIND" in l])
+    check("fpk 默认绑 0.0.0.0（局域网可访问）",
+          'PANEL_BIND="${PANEL_BIND:-0.0.0.0}"' in main_sh)
+
+    lib = open(os.path.join(root, "app", "shell", "lib.sh"), encoding="utf-8").read()
+    check("lib.sh 就绪探测用 /panel-api/health",
+          "/panel-api/health" in lib and "/api/health" not in lib.replace("/panel-api/health", ""),
+          [l.strip() for l in lib.splitlines() if "health" in l])
+
+    # Docker 侧本来就对，这里做交叉确认，避免以后改回去
+    ep = open(os.path.join(root, "docker", "entrypoint.sh"), encoding="utf-8").read()
+    check("Docker entrypoint 仍设 PANEL_BIND=0.0.0.0",
+          'PANEL_BIND="${PANEL_BIND:-0.0.0.0}"' in ep)
+    check("Docker entrypoint 用 /panel-api/health", "/panel-api/health" in ep)
+    hc = open(os.path.join(root, "docker", "healthcheck.sh"), encoding="utf-8").read()
+    check("Docker healthcheck 用 /panel-api/health", "/panel-api/health" in hc)
+
     print("")
     print("通过 %d 项，失败 %d 项" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1

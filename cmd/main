@@ -52,11 +52,15 @@ start_shell() {
 
     vnt_log "starting shell backend: $PYTHON_BIN $SHELL_PY"
     cd "${TRIM_APPDEST}/shell" || vnt_fail "无法进入 shell 目录"
+    # PANEL_BIND 必须显式设为 0.0.0.0：管理页对局域网开放，飞牛桌面/手机
+    # 才访问得到。不设的话 shell 侧默认绑 127.0.0.1，表现为「插件装了但打不开」。
+    # 想只允许本机访问，把下面这行改成 PANEL_BIND=127.0.0.1。
     VNT_APPDEST="$TRIM_APPDEST" \
     VNT_PKGVAR="$TRIM_PKGVAR" \
     VNT_PKGETC="$TRIM_PKGETC" \
     VNT_PKGTMP="$TRIM_PKGTMP" \
     VNT_APPNAME="$TRIM_APPNAME" \
+    PANEL_BIND="${PANEL_BIND:-0.0.0.0}" \
     ${LOG_DIR:+LOG_DIR="$LOG_DIR"} \
     nohup "$PYTHON_BIN" "$SHELL_PY" >> "$SHELL_LOG" 2>&1 &
     local pid=$!

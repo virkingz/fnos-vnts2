@@ -70,6 +70,10 @@ appcenter-cli install-fpk fnos-vnts2.fpk
 
 安装过程**不下载任何二进制**，所以装得很快，也不受网络影响。
 
+> **管理页对局域网开放**（绑定 `0.0.0.0`），这样飞牛桌面、手机浏览器都能打开。
+> 想只允许本机访问，把 `cmd/main` 里的 `PANEL_BIND="${PANEL_BIND:-0.0.0.0}"`
+> 改成 `127.0.0.1` 后重启应用。
+
 ## 使用（四步）
 
 **第一步：下载核心**
@@ -383,7 +387,7 @@ python scripts/test_import_export.py  # 导入导出专项（28 项）
 python scripts/test_console.py        # 控制台反代与控制台联动（41 项）
 python scripts/test_console_real.py   # 真实前端结构全链路（24 项，素材取自 vnts 二进制）
 python scripts/test_concurrency.py    # 并发与连接复用（8 项）
-python scripts/test_netconf.py        # 下载源/代理/端口分设：校验、自愈、回退、导出（56 项）
+python scripts/test_netconf.py        # 下载源/代理/端口/启动一致性：校验、自愈、回退（62 项）
 python scripts/test_dnspeers.py       # 出站互联域名同步：先加后删/自愈/IPv6/401 重登（158 项）
 python scripts/test_socks_log.py      # SOCKS5 协议与中继、日志级别与 KB 档、RST 静默（71 项）
 node   scripts/probe_vite_url.js      # Vite 资源路径改写校验（0 错误）
