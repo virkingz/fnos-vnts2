@@ -98,21 +98,34 @@ def main():
     check("socks 前缀被拒", bool(err), err)
 
     # ------------------------------------------------------------------
-    print("[3] 保存代理先实测（不通就不落盘）")
-    def dead_open(url, timeout=30, proxy=None, method="GET"):
+    print("[3] 保存代理不实测（直接落盘，通不通交给「测试连通性」）")
+    # 为什么不在保存时实测：保存是用户的动作，面板不该代它发起外连 ——
+    # 会在代理端留下莫名的连接记录，用户会误以为有异常流量。
+    calls = []
+
+    def counting_open(url, timeout=30, proxy=None, method="GET"):
+        calls.append(url)
         raise TimeoutError("timed out")
 
     real_open = S._open
-    S._open = dead_open
+    S._open = counting_open
     res = S.set_proxy("http://127.0.0.1:7890")
-    check("代理不通 -> 不保存", res.get("ok") is False and "未保存" in res.get("error", ""),
-          res.get("error"))
-    check("proxy 文件仍为空", S.get_proxy() == "", repr(S.get_proxy()))
+    check("即使代理连不通也照常保存", res.get("ok") is True, res)
+    check("保存过程没有发起任何网络请求", calls == [], calls)
+    check("已落盘", S.get_proxy() == "http://127.0.0.1:7890", repr(S.get_proxy()))
 
-    S._open = lambda url, timeout=30, proxy=None, method="GET": FakeResp(b"ok")
-    res = S.set_proxy("http://127.0.0.1:7890")
-    check("代理可用 -> 保存并归一化", res.get("ok") and S.get_proxy() == "http://127.0.0.1:7890",
-          S.get_proxy())
+    # socks5 同样直接存
+    S.write_file(S.PROXY_FILE, "")
+    res = S.set_proxy("socks5h://192.168.1.10:1080")
+    check("socks5h 也能直接保存", res.get("ok") is True, res)
+    check("socks5h 已落盘", S.get_proxy() == "socks5h://192.168.1.10:1080", S.get_proxy())
+    check("保存仍未发起网络请求", calls == [], calls)
+
+    # 格式错误仍要拦（这是本地校验，不涉网络）
+    res = S.set_proxy("socks4://1.2.3.4:1080")
+    check("非法格式仍被拒", res.get("ok") is False and "SOCKS5" in res.get("error", ""),
+          res.get("error"))
+
     S._open = real_open
 
     # ------------------------------------------------------------------
@@ -149,11 +162,12 @@ def main():
     S._open = selective_open
     r = S.probe_network()
     names = [c["name"] for c in r["checks"]]
-    check("含直连/镜像/代理/实际路径四项", len(names) == 4, names)
+    # 只测与「下核心」直接相关的项；不再测直连 GitHub
+    check("含镜像/代理/实际路径三项", len(names) == 3, names)
+    check("不再出现「直连 GitHub」项", "直连 GitHub" not in names, names)
     check("结论为不通", r["ok"] is False)
     check("提示指向代理", "代理" in r["hint"], r["hint"])
     by = {c["name"]: c for c in r["checks"]}
-    check("直连判定可达", by["直连 GitHub"]["ok"] is True)
     check("代理判定不可达", by["网络代理"]["ok"] is False, by["网络代理"]["detail"])
     check("实际下载路径不可达", by["实际下载路径"]["ok"] is False)
 

@@ -142,6 +142,71 @@ def main():
     check("本机旧清单已被替换",
           "local.example.com" not in json.dumps(doc, ensure_ascii=False))
 
+    # ------------------------------------------------------------------
+    print("\n[?] 导入会真的把互联同步到核心")
+    # 曾经的故障：dns-ip.json 导进来了，但同步没能落到核心，
+    # 看起来「导入没生效」。两个原因：
+    #   1) 同步发生在核心重启**之前** —— 重启后核心又从数据库重新加载；
+    #   2) 核心没运行时 sync_dns_peers 里 core_running 那道关卡直接跳过。
+    order = []
+
+    def fake_sync(once=False, log_prefix="域名同步"):
+        order.append(("sync", log_prefix))
+        return {"ok": True, "actions": [], "error": ""}
+
+    orig_sync = S.sync_dns_peers
+    try:
+        S.sync_dns_peers = fake_sync
+        order.clear()
+        buf3 = io.BytesIO()
+        with zipfile.ZipFile(buf3, "w") as zz:
+            zz.writestr("server/config.toml",
+                        open(os.path.join(sdir, "config.toml")).read())
+            zz.writestr("server/dns-ip.json", json.dumps(pkg_doc))
+        r3 = S.import_bundle(buf3.getvalue())
+        check("导入成功", r3["ok"], r3)
+        check("导入过程触发了同步",
+              [k for k, _ in order] == ["sync"], order)
+        check("同步用的是「导入后」这个语义",
+              order[0][1] == "域名同步（导入后）", order)
+    finally:
+        S.sync_dns_peers = orig_sync
+
+    # ------------------------------------------------------------------
+    print("\n[?] 核心起来后必定补一次同步（启动 / 重启两条路径）")
+    # 这是「导入后互联能生效」的另一半保证：同步要经控制台 API 写进
+    # 核心数据库，因此必须在核心就绪之后做。start/restart 都补一次，
+    # 就不依赖「导入时核心恰好开着」这个前提。
+    calls = []
+
+    def spy(once=False, log_prefix="域名同步"):
+        calls.append(log_prefix)
+        return {"ok": True, "actions": [], "error": ""}
+
+    orig_sync2 = S.sync_dns_peers
+    orig_start_locked = S._start_core_locked
+    orig_stop_locked = S._stop_core_locked
+    try:
+        S.sync_dns_peers = spy
+        S._start_core_locked = lambda: (True, "已启动")
+        S._stop_core_locked = lambda: True
+        calls.clear()
+        S.start_core()
+        check("start_core 触发同步", len(calls) == 1 and "启动后" in calls[0], calls)
+        calls.clear()
+        S.restart_core()
+        check("restart_core 触发同步", len(calls) == 1 and "重启后" in calls[0], calls)
+
+        # 启动失败不应同步（否则会打一堆无意义的失败日志）
+        S._start_core_locked = lambda: (False, "启动失败")
+        calls.clear()
+        S.start_core()
+        check("启动失败时不同步", calls == [], calls)
+    finally:
+        S.sync_dns_peers = orig_sync2
+        S._start_core_locked = orig_start_locked
+        S._stop_core_locked = orig_stop_locked
+
     shutil.rmtree(base, ignore_errors=True)
     print("\n===== 结果：%d 通过 / %d 失败 =====" % (PASS, FAIL))
     return 1 if FAIL else 0

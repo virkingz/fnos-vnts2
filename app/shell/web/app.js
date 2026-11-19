@@ -511,7 +511,14 @@
         .then(function (j) {
           if (j.code !== 0) throw new Error(j.msg);
           $('#importResult').textContent = '已导入：' + (j.data.restored || []).join('、');
-          toast('导入成功', 'ok');
+          // 核心没跑时，出站互联要等核心起来才会同步 —— 如实说明，
+          // 免得用户以为「导入了却没生效」
+          if (j.data.notice) {
+            toast('导入成功，但核心未运行', 'ok');
+            $('#importResult').textContent += '　' + j.data.notice;
+          } else {
+            toast('导入成功', 'ok');
+          }
           loadState(); loadPorts();
           api('/settings').then(fillSettings);
         })

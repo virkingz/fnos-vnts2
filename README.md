@@ -188,7 +188,8 @@ appcenter-cli install-fpk fnos-vnts2.fpk
 - **导出**：打包 `config.toml`（唯一配置文件）、`network_control.db`（网络/设备记录）、
   证书文件为一个 zip。**不含日志**，也不含核心二进制。用于迁移到新机器或定期备份。
 - **导入**：选择之前导出的 zip。导入前**自动备份**现有 `server/` 目录，失败**自动回滚**。
-  导入后核心自动重启。
+  核心在运行时导入会自动重启；核心未运行时保持原状，出站互联会在核心启动后
+  自动同步（页面会提示这一点）。
 
 ### 迁移到新机器的推荐流程
 
@@ -318,11 +319,14 @@ vnts 官方发版频繁。管理页「核心更新」标签：
 - SOCKS 由本项目以**纯标准库**实现（`app/shell/socks5.py`），不引入任何第三方依赖。
   做法是起一个本地回环中转端口，把 urllib 的 `CONNECT` 转发进 SOCKS5 隧道，
   对上层完全透明。仅支持 SOCKS5，`socks4://` 会被明确拒绝。
-- 代理**保存前先实测**，连不通则不保存，原有设置不变；历史误配会在启动时自动纠正
-  （把代理栏里的加速前缀挪到镜像栏）。
+- 代理**保存即生效，不做连通性实测**：保存是用户的动作，面板不该代它发起外连 ——
+  否则会在代理端留下一条莫名的连接记录。通不通请点「测试连通性」自行确认。
+  历史误配仍会在启动时自动纠正（把代理栏里的加速前缀挪到镜像栏）。
 - 下载核心时按 `配置路径 → 镜像直连 → GitHub 直连` 依次回退，一次误配不会把更新锁死。
-- 点「测试连通性」会**分项**报告：直连 / 镜像前缀 / 网络代理 / 实际下载路径，
-  每项带耗时与原因（超时、拒绝、解析失败、限流、需要认证）。
+- 点「测试连通性」只测**能不能下到核心**，分项报告：镜像前缀 / 网络代理 /
+  实际下载路径，每项带耗时与原因（超时、拒绝、解析失败、限流、需要认证）。
+  **不测「直连 GitHub」** —— 国内网络下它几乎必然超时，而你的配置本就是
+  镜像/代理那条路，红着一行只会误导。判定标准就是「实际下载路径」的结果。
 
 > **关于 `no_proxy`**：若环境变量里设了 `no_proxy`（例如含 `127.0.0.1`），
 > 访问这些主机时 urllib 会按惯例直连、绕过代理。面板访问的是 `github.com`
@@ -383,11 +387,11 @@ bash scripts/pack.sh            # 产出 fnos-vnts2.fpk
 bash scripts/pack.sh 1.0.1      # 指定版本
 
 python scripts/test_e2e.py            # 端到端（69 项）
-python scripts/test_import_export.py  # 导入导出专项（28 项）
+python scripts/test_import_export.py  # 导入导出 + 互联同步时机（34 项）
 python scripts/test_console.py        # 控制台反代与控制台联动（41 项）
 python scripts/test_console_real.py   # 真实前端结构全链路（24 项，素材取自 vnts 二进制）
 python scripts/test_concurrency.py    # 并发与连接复用（8 项）
-python scripts/test_netconf.py        # 下载源/代理/端口/启动一致性：校验、自愈、回退（62 项）
+python scripts/test_netconf.py        # 下载源/代理/端口/启动一致性：校验、自愈、回退（66 项）
 python scripts/test_dnspeers.py       # 出站互联域名同步：先加后删/自愈/IPv6/401 重登（158 项）
 python scripts/test_socks_log.py      # SOCKS5 协议与中继、日志级别与 KB 档、RST 静默（71 项）
 node   scripts/probe_vite_url.js      # Vite 资源路径改写校验（0 错误）

@@ -687,14 +687,15 @@ def describe_net_error(e):
 
 
 def set_proxy(p):
-    """保存代理：先校验格式，再实测一次；不可用则不保存（避免把功能配死）。"""
+    """保存代理：只校验格式，**不实测**。
+
+    为什么不实测：保存是用户的动作，不该由面板代发起外连 —— 启动了代理时
+    会在代理端留下一条莫名的连接记录（用户会以为是异常流量）。
+    通不通由用户点「测试连通性」自行确认，那里会走完整的下载路径。
+    """
     norm, err = normalize_proxy(p)
     if err:
         return {"ok": False, "error": err}
-    if norm:
-        ok, detail = probe_proxy(norm)
-        if not ok:
-            return {"ok": False, "error": "代理不可用：%s（未保存，原有设置不变）" % detail}
     write_file(PROXY_FILE, norm)
     return {"ok": True, "proxy": norm}
 
@@ -1029,10 +1030,18 @@ def _probe_url(url, proxy, timeout=10):
 
 
 def probe_network(timeout=10):
-    """分项探测下载链路。
+    """探测「能不能下到核心」。
 
-    判定标准是「能不能真的下到核心」：配了镜像/代理时，以
-    「镜像+代理」这条实际路径的结果为准，而不是笼统地报一个失败。
+    只关心一件事：**按当前配置，核心文件下得下来吗**。
+    因此只测与下载直接相关的两项（配了才测）：
+
+      - 镜像前缀   ：镜像地址本身通不通
+      - 网络代理   ：代理隧道通不通
+      - 实际下载路径：把镜像+代理一起用上，去取**真实的版本文件**
+
+    **不测「直连 GitHub」**：国内网络下它几乎必然超时，而用户的配置
+    本就是「镜像/代理」这条路 —— 红着一行既无意义又误导，
+    会让人以为配置有问题。判定标准就是最后一行的结果。
     """
     mirror = get_mirror()
     proxy = get_proxy()
@@ -1040,9 +1049,6 @@ def probe_network(timeout=10):
 
     def add(name, ok, detail, url=""):
         checks.append({"name": name, "ok": bool(ok), "detail": detail, "url": url})
-
-    direct_ok, direct_detail = _probe_url(RELEASES_LATEST, "", timeout)
-    add("直连 GitHub", direct_ok, direct_detail, RELEASES_LATEST)
 
     mirror_ok = None
     if mirror:
@@ -1055,26 +1061,27 @@ def probe_network(timeout=10):
         proxy_ok, pd = _probe_url(RELEASES_LATEST, proxy, timeout)
         add("网络代理", proxy_ok, pd, RELEASES_LATEST)
 
-    hint = ""
-    if mirror or proxy:
-        pu = url_with_mirror(RELEASES_LATEST)
-        pu_ok, pu_detail = _probe_url(pu, None if proxy else "", timeout)
-        add("实际下载路径", pu_ok, pu_detail, pu)
-        ok = pu_ok
-    else:
-        ok = direct_ok
+    # 实际下载路径：镜像与代理一起用上，这才是真正下核心时走的链路。
+    # 没配镜像/代理时，这一项等价于直连 —— 仍需测，因为它是判定依据。
+    pu = url_with_mirror(RELEASES_LATEST)
+    pu_proxy = proxy or ""
+    pu_ok, pu_detail = _probe_url(pu, pu_proxy, timeout)
+    add("实际下载路径", pu_ok, pu_detail, pu)
+    ok = pu_ok
 
     # 给能直接照做的修法，而不是只说失败
+    hint = ""
     if not ok:
         if proxy and _MIRROR_LIKE.match(proxy):
             hint = ("代理栏里的 %s 是「加速前缀」不是代理，请清空代理、把它填到镜像前缀"
                     % proxy)
         elif proxy and proxy_ok is False:
-            hint = "代理连不上：清空代理后重试，或改成 http://127.0.0.1:7890 这类带端口的地址"
+            hint = "代理连不上：检查地址与端口，或清空代理改直连/镜像"
         elif mirror and mirror_ok is False:
-            hint = "镜像前缀不可用：清空镜像直连 GitHub，或换一个加速前缀"
-        elif not direct_ok:
-            hint = "直连 GitHub 不通（常见于国内网络），请配置镜像前缀或代理"
+            hint = "镜像前缀不可用：换一个加速前缀，或清空镜像直连 GitHub"
+        else:
+            hint = ("下载不通（国内网络常见）。建议填一个镜像前缀；"
+                    "若已填镜像仍不通，检查镜像地址是否写对、或改用代理")
     return {"ok": ok, "checks": checks, "hint": hint,
             "mirror": mirror, "proxy": proxy}
 
@@ -1372,9 +1379,27 @@ def _start_core_locked():
     return True, "核心运行中 (pid=%d)" % proc.pid
 
 
+def _sync_after_core_up(prefix):
+    """核心刚就绪时补一次域名同步。
+
+    为什么必须放在核心起来之后：同步是经**控制台 API**把地址写进核心的
+    SQLite（`/api/peer_servers`），核心没运行就无从写起。而 dns-ip.json
+    随时可能被改（保存清单、导入配置），所以每次核心就绪都补一次，
+    不必等下一个轮询周期。
+    """
+    try:
+        sync_dns_peers(log_prefix=prefix)
+    except Exception as e:  # noqa: BLE001
+        log("%s 失败: %s" % (prefix, e))
+
+
 def start_core():
+    """启动核心；成功后立刻补一次域名同步（见 _sync_after_core_up）。"""
     with _proc_lock:
-        return _start_core_locked()
+        ok, msg = _start_core_locked()
+    if ok:
+        _sync_after_core_up("域名同步（核心启动后）")
+    return ok, msg
 
 
 def restart_core():
@@ -1387,7 +1412,10 @@ def restart_core():
     """
     with _proc_lock:
         _stop_core_locked()
-        return _start_core_locked()
+        ok, msg = _start_core_locked()
+    if ok:
+        _sync_after_core_up("域名同步（核心重启后）")
+    return ok, msg
 
 
 # ---------------------------------------------------------------------------
@@ -1767,9 +1795,4 @@ def bootstrap():
     log("bootstrap: %s" % msg)
     if ok:
         mark_autostart(True)
-        # 核心刚起来，立刻补一次域名同步：不等下一个轮询周期
-        # （核心未运行时互联记录会全断，起来后要马上恢复）
-        try:
-            sync_dns_peers(log_prefix="域名同步（核心启动后）")
-        except Exception as e:  # noqa: BLE001
-            log("核心启动后同步域名失败: %s" % e)
+        # 域名同步由 start_core() 内部负责，这里不再重复

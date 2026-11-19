@@ -519,8 +519,18 @@ class Handler(BaseHTTPRequestHandler):
             res = P.import_bundle(raw)
             if not res.get("ok"):
                 return self.err(res.get("error", "导入失败"))
+            # 核心在跑 → 重启它，让导入的配置（含出站互联）真正生效。
+            # restart_core 内部会在启动后再补一次域名同步 —— 同步要经控制台
+            # API 写进核心数据库，必须在核心就绪之后做。
+            # 核心没跑 → 不主动拉起（保持用户原有的运行状态），但要如实告诉
+            # 用户「互联要等核心启动后才会同步」，免得他以为导入没生效。
             if P.core_running():
                 P.restart_core()
+                res["core"] = "restarted"
+            else:
+                res["core"] = "stopped"
+                res["notice"] = ("核心当前未运行。导入的出站互联域名会在核心"
+                                 "启动后自动同步（约 30 秒内），无需手工操作。")
             return self.ok(res)
 
         if path == "/console-info":
