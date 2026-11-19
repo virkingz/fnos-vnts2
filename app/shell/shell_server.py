@@ -31,7 +31,6 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import dns_peers as DP  # noqa: E402
-import socks5 as SOCKS  # noqa: E402
 import vnts_config as C  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -596,19 +595,16 @@ def normalize_proxy(p):
         return "", "代理地址格式无效：%s" % p
 
     if scheme in _SOCKS_SCHEMES:
-        # SOCKS5 由本项目的 socks5.py 以纯标准库实现（起本地中转端口，
-        # 把 urllib 的 CONNECT 转发进 SOCKS5 隧道）。仅支持 SOCKS5；
-        # SOCKS4 协议更老且缺少域名支持，不实现。
-        if scheme not in ("socks5", "socks5h"):
-            return "", ("只支持 SOCKS5 代理（socks5:// 或 socks5h://）。"
-                        "SOCKS4 不支持，请改用 socks5://")
+        # 各协议都交给 curl 处理（见页面里的说明），因此 socks4/socks4a
+        # 也一并放行 —— 与同作者的 fnos-vnt2 行为一致。
         if not host:
             return "", "代理地址缺少主机名"
         if not port:
-            return "", "代理地址缺少端口，例如 socks5://127.0.0.1:7891"
+            return "", "代理地址缺少端口，例如 socks5h://127.0.0.1:7891"
         return "%s://%s:%d" % (scheme, host, port), ""
     if scheme not in ("http", "https"):
-        return "", ("代理地址只支持 http:// 、https:// 或 socks5:// 开头")
+        return "", ("代理地址只支持 http:// 、https:// 、socks5:// "
+                    "或 socks4:// 开头")
     if not host:
         return "", "代理地址缺少主机名"
     if not port:
@@ -644,22 +640,6 @@ def normalize_mirror(m):
     if u.port:
         warn = "镜像前缀通常不带端口；若 %s 其实是 HTTP 代理，请改填到「网络代理」" % m
     return m, "", warn
-
-
-def probe_proxy(proxy, timeout=8):
-    """实测代理是否可用。只要收到 HTTP 响应（含 4xx/5xx）即视为通路正常。"""
-    url = "https://api.github.com/repos/vnt-dev/vnts/releases/latest"
-    try:
-        with _open(url, timeout=timeout, proxy=proxy) as r:
-            r.read(64)
-        return True, "OK"
-    except urllib.error.HTTPError as e:
-        # 407 = 代理要求认证；其余状态码说明代理已把请求转出去了
-        if e.code == 407:
-            return False, "代理要求认证（407），面板不支持带账号密码的代理"
-        return True, "HTTP %d" % e.code
-    except Exception as e:  # noqa: BLE001
-        return False, describe_net_error(e)
 
 
 def describe_net_error(e):
@@ -714,37 +694,62 @@ def url_with_mirror(u):
 
 
 def _is_socks(proxy):
-    """判断代理串是否为 SOCKS5。"""
-    return str(proxy or "").lower().startswith("socks5")
+    """判断代理串是否为 SOCKS 系（socks5 / socks5h / socks4 / socks4a）。"""
+    return str(proxy or "").lower().startswith("socks")
 
 
-def _socks_relay(proxy):
-    """为 SOCKS5 代理起一个本地中转，返回 (中转代理地址, 服务器对象)。
+# ---------------------------------------------------------------------------
+# 经代理发请求：统一交给 curl
+#
+# 为什么不自己实现 SOCKS5：早期版本起过一个本地回环中转，把 urllib 的
+# CONNECT 转成 SOCKS5 CONNECT。它在 Clash 系代理上不可用 —— 表现为
+# HTTP 代理正常、SOCKS5 报 HTTP 554。那条路径把 HTTPS 请求转成
+# 「urllib 以为在用 HTTP 代理」的形态，与 curl 这类成熟实现的握手/隧道
+# 语义并不等价，自己维护协议栈也不划算。
+#
+# 现在与同作者的 fnos-vnt2 保持一致：只要有代理就调 curl，
+# 由 curl 原生处理 http/https/socks5/socks5h/socks4 —— 三种协议行为一致。
+# ---------------------------------------------------------------------------
+def find_curl():
+    """找一个可用的 curl，返回路径；找不到返回空串。"""
+    for c in ("/usr/bin/curl", "/usr/local/bin/curl", "curl"):
+        try:
+            r = subprocess.run([c, "--version"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return c
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
 
-    调用方必须在用完（或异常）时调 server.stop()，否则监听端口会泄漏。
-    socks5h 走远端 DNS，域名原样交给代理解析 —— 这与 Clash 等工具的惯例一致，
-    也是内网域名经代理访问时唯一可行的方式。
-    """
-    u = urllib.parse.urlsplit(proxy)
-    remote_dns = u.scheme.lower() == "socks5h"
-    srv = SOCKS.SocksRelayServer(u.hostname, u.port, remote_dns=remote_dns,
-                                 timeout=30)
-    port = srv.start()
-    return "http://127.0.0.1:%d" % port, srv
 
+class _CurlResponse(object):
+    """curl 结果的响应包装：只实现调用方用到的那几个属性/方法。"""
 
-class _SocksResponse(object):
-    """把 (response, relay) 包一层，让 close() 时顺带关掉中转服务器。
+    def __init__(self, status, body, url):
+        self.status = status
+        self.code = status
+        self._body = body
+        self._url = url
+        self._pos = 0
+        self.closed = False
 
-    不这样做的话，每次请求都会留下一个监听端口和线程，长时间运行会累积。
-    """
+    def read(self, n=-1):
+        if n is None or n < 0:
+            data = self._body[self._pos:]
+            self._pos = len(self._body)
+            return data
+        data = self._body[self._pos:self._pos + n]
+        self._pos += len(data)
+        return data
 
-    def __init__(self, resp, relay):
-        self._resp = resp
-        self._relay = relay
+    def geturl(self):
+        return self._url
 
-    def __getattr__(self, name):
-        return getattr(self._resp, name)
+    def info(self):
+        return {}
+
+    def close(self):
+        self.closed = True
 
     def __enter__(self):
         return self
@@ -753,13 +758,42 @@ class _SocksResponse(object):
         self.close()
         return False
 
-    def close(self):
+
+def _curl_run(url, proxy, timeout, method="GET", headers=None):
+    """调 curl 取 url，返回 (status, body)。失败抛异常（消息可直接展示）。"""
+    curl = find_curl()
+    if not curl:
+        raise RuntimeError("未找到 curl —— SOCKS 代理需要它，请先安装")
+    args = [curl, "-sSL", "--max-time", str(timeout),
+            "-w", "\n%{http_code}", "-A", "vnts-nas-fpk"]
+    if method == "HEAD":
+        args.append("-I")
+    for k, v in (headers or {}).items():
+        args += ["-H", "%s: %s" % (k, v)]
+    if proxy:
+        # --noproxy "" 显式关掉 NO_PROXY 环境变量的影响：
+        # 否则环境里若设了 no_proxy=127.0.0.1（很常见），curl 会绕过代理
+        # 直连，行为与用户预期不符（配了代理却没走代理）。
+        args += ["--proxy", proxy, "--noproxy", ""]
+    args.append(url)
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=timeout + 15)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError("超时（%ds）" % timeout)
+    if r.returncode != 0:
+        raise RuntimeError(
+            (r.stderr or b"").decode("utf-8", "replace").strip()
+            or "curl 退出码 %d" % r.returncode)
+    out = r.stdout
+    idx = out.rfind(b"\n")
+    body = out[:idx] if idx >= 0 else out
+    code = 0
+    if idx >= 0:
         try:
-            self._resp.close()
-        finally:
-            if self._relay is not None:
-                self._relay.stop()
-                self._relay = None
+            code = int(out[idx + 1:] or b"0")
+        except ValueError:
+            code = 0
+    return code, body
 
 
 def _open(url, timeout=30, proxy=None, method="GET"):
@@ -767,38 +801,36 @@ def _open(url, timeout=30, proxy=None, method="GET"):
 
     proxy=None  -> 使用配置里的代理（若有）
     proxy=""    -> 强制直连，同时禁用系统环境变量里的 http_proxy
-    proxy="x://host:port" -> 用指定代理（http/https/socks5/socks5h）
+    proxy="x://host:port" -> 用指定代理（http/https/socks5/socks5h/socks4）
+
+    **有代理时优先交给 curl**（与同作者的 fnos-vnt2 同策略）：
+    curl 原生支持各协议，行为统一，也省掉自己维护 SOCKS5 协议栈的成本。
+    无代理时走 urllib 直连（并显式清掉环境变量里的 http_proxy）。
+
+    环境里没有 curl 时的降级：HTTP/HTTPS 代理仍可交给 urllib（它原生支持），
+    SOCKS 代理则无法工作 —— 这时抛出明确提示，而不是静默失败。
     """
     headers = {
         "User-Agent": "vnts-nas-fpk",
         "Accept": "application/vnd.github+json, */*",
     }
-    req = urllib.request.Request(url, method=method, headers=headers)
     if proxy is None:
         proxy = get_proxy()
 
-    if proxy and _is_socks(proxy):
-        # SOCKS5：起本地中转，让 urllib 以为在用普通 http 代理
-        local, relay = _socks_relay(proxy)
-        try:
-            op = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": local, "https": local})
-            )
-            resp = op.open(req, timeout=timeout)
-        except Exception:
-            relay.stop()
-            raise
-        return _SocksResponse(resp, relay)
-
     if proxy:
+        if find_curl() or _is_socks(proxy):
+            code, body = _curl_run(url, proxy, timeout, method=method,
+                                   headers=headers)
+            return _CurlResponse(code, body, url)
+        # 无 curl 且是 HTTP(S) 代理：urllib 也能做，降级处理
         op = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-        )
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        req = urllib.request.Request(url, method=method, headers=headers)
         return op.open(req, timeout=timeout)
-    if proxy == "":  # 显式直连
-        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        return op.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout)
+
+    req = urllib.request.Request(url, method=method, headers=headers)
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return op.open(req, timeout=timeout)
 
 
 def _proxy_opener():
@@ -806,23 +838,18 @@ def _proxy_opener():
     proxy = get_proxy()
 
     def _opener(req, timeout=30):
-        if proxy and _is_socks(proxy):
-            local, relay = _socks_relay(proxy)
-            try:
-                op = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": local, "https": local})
-                )
-                resp = op.open(req, timeout=timeout)
-            except Exception:
-                relay.stop()
-                raise
-            return _SocksResponse(resp, relay)
         if proxy:
+            if find_curl() or _is_socks(proxy):
+                headers = dict(req.header_items())
+                code, body = _curl_run(req.full_url, proxy, timeout,
+                                       method=req.get_method() or "GET",
+                                       headers=headers)
+                return _CurlResponse(code, body, req.full_url)
             op = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-            )
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
             return op.open(req, timeout=timeout)
-        return urllib.request.urlopen(req, timeout=timeout)
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return op.open(req, timeout=timeout)
 
     return _opener
 
@@ -989,13 +1016,37 @@ def _latest_via_api():
 
 
 def _latest_via_redirect():
+    """不调 API，直接跟随 releases/latest 的 302 拿版本号。
+
+    这是 api.github.com 之外的一条路：api.github.com 对未认证请求限流更严
+    （60 次/小时），且国内直连成功率更低；而 releases/latest 只是个跳转，
+    经镜像前缀也能用。
+    """
     url = url_with_mirror("https://github.com/vnt-dev/vnts/releases/latest")
-    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "vnts-nas-fpk"})
-    try:
-        r = _proxy_opener()(req, timeout=20)
-        eff = r.geturl()
-    except urllib.error.HTTPError as e:
-        eff = e.geturl() if hasattr(e, "geturl") else ""
+    proxy = get_proxy()
+    if proxy:
+        # 交给 curl 取最终地址：%{url_effective} 就是跟随重定向后的 URL
+        curl = find_curl()
+        if not curl:
+            return ""
+        args = [curl, "-sSLI", "-o", os.devnull, "--max-time", "20",
+                "-w", "%{url_effective}", "-A", "vnts-nas-fpk",
+                "--proxy", proxy, "--noproxy", "", url]
+        try:
+            r = subprocess.run(args, capture_output=True, timeout=35)
+        except subprocess.TimeoutExpired:
+            return ""
+        if r.returncode != 0:
+            return ""
+        eff = r.stdout.decode("utf-8", "replace").strip()
+    else:
+        req = urllib.request.Request(
+            url, method="HEAD", headers={"User-Agent": "vnts-nas-fpk"})
+        try:
+            r = _proxy_opener()(req, timeout=20)
+            eff = r.geturl()
+        except urllib.error.HTTPError as e:
+            eff = e.geturl() if hasattr(e, "geturl") else ""
     eff = eff.replace("%3A", ":").replace("%2F", "/")
     tag = eff.rstrip("/").split("/")[-1].lstrip("v")
     return tag

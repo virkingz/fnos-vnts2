@@ -328,11 +328,8 @@ vnts 官方发版频繁。管理页「核心更新」标签：
   **不测「直连 GitHub」** —— 国内网络下它几乎必然超时，而你的配置本就是
   镜像/代理那条路，红着一行只会误导。判定标准就是「实际下载路径」的结果。
 
-> **关于 `no_proxy`**：若环境变量里设了 `no_proxy`（例如含 `127.0.0.1`），
-> 访问这些主机时 urllib 会按惯例直连、绕过代理。面板访问的是 `github.com`
-> 这类外部域名，不受影响；只有你把目标设成本机地址时才会遇到。
-
-> Docker 的 `PROXY` 环境变量与 fpk 升级回调走 `curl`，那条路径原生支持 `socks5h://`。
+> **关于 `no_proxy`**：curl 默认也读 `NO_PROXY`，不处理会出现「配了代理却没走代理」。
+> 因此面板调 curl 时一律带 `--noproxy ""` 显式关掉它，让代理设置始终生效。
 
 ## 日志级别与轮转
 
@@ -391,9 +388,9 @@ python scripts/test_import_export.py  # 导入导出 + 互联同步时机（34 �
 python scripts/test_console.py        # 控制台反代与控制台联动（41 项）
 python scripts/test_console_real.py   # 真实前端结构全链路（24 项，素材取自 vnts 二进制）
 python scripts/test_concurrency.py    # 并发与连接复用（8 项）
-python scripts/test_netconf.py        # 下载源/代理/端口/启动一致性：校验、自愈、回退（66 项）
+python scripts/test_netconf.py        # 下载源/代理/端口/启动一致性：校验、自愈、回退（70 项）
 python scripts/test_dnspeers.py       # 出站互联域名同步：先加后删/自愈/IPv6/401 重登（158 项）
-python scripts/test_socks_log.py      # SOCKS5 协议与中继、日志级别与 KB 档、RST 静默（71 项）
+python scripts/test_socks_log.py      # curl 代理方案、日志级别与 KB 档、RST 静默（72 项）
 node   scripts/probe_vite_url.js      # Vite 资源路径改写校验（0 错误）
 ```
 

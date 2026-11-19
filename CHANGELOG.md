@@ -89,6 +89,18 @@ vnts2 用 `SocketAddr` 解析 `peer_servers`，**只接受字面 `IP:端口`**�
 
 ### 变更
 
+- **代理改用 curl 实现（与 fnos-vnt2 一致），修掉 SOCKS5 报 HTTP 554**：
+  切到「下载源与代理」填 `socks5://` 或 `socks5h://` 时，Clash 系代理会返回
+  `HTTP 554`，而同一个代理用 `http://` 却正常。原因是早期版本自己实现了一套
+  SOCKS5（起本地回环中转，把 urllib 的 CONNECT 转成 SOCKS5 CONNECT），
+  那条路径把 HTTPS 请求转成「urllib 以为在用 HTTP 代理」的形态，与成熟实现的
+  隧道语义并不等价。现在只要有代理就调 `curl --proxy`，由 curl 原生处理
+  http/https/socks5/socks5h/socks4 —— 四种协议行为统一，也删掉了 `socks5.py`。
+  - `socks4://` / `socks4a://` 现在也放行（原先明确拒绝）
+  - curl 调用一律带 `--noproxy ""`：否则环境里的 `NO_PROXY` 会让 curl 绕过
+    代理直连，出现「配了代理却没走代理」
+  - 环境无 curl 时降级：HTTP/HTTPS 代理仍走 urllib，SOCKS 代理明确报错
+    （Docker 镜像与飞牛系统均已自带 curl）
 - **保存代理不再做连通性实测**：保存即落盘、立即生效。原因是保存是用户的动作，
   面板不该代它发起外连 —— 配了 socks5/socks5h 时会在代理端留下一条莫名的
   连接记录，用户会误以为有异常流量。通不通改由用户点「测试连通性」确认。

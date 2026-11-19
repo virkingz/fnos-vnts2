@@ -98,12 +98,11 @@
         </div>
         <div class="field">
           <label>网络代理</label>
-          <input type="text" id="proxy" class="inp" placeholder="http://127.0.0.1:7890 或 socks5h://127.0.0.1:7891">
+          <input type="text" id="proxy" class="inp" placeholder="socks5://127.0.0.1:1080 或 http://127.0.0.1:7890">
           <p class="muted">
-            支持 <b>HTTP / HTTPS / SOCKS5</b>，必须带端口。<b>保存后直接生效</b>，
-            是否真的通，请点右边「测试连通性」确认。<br>
-            SOCKS5 两种写法：<code>socks5://</code> 由本机解析域名，
-            <code>socks5h://</code> 把域名交给代理解析（远端 DNS，内网域名用它）。
+            支持 <code>socks5://</code>（推荐 <code>socks5h://</code>，由代理解析 DNS）、
+            <code>socks4://</code>、<code>http://</code>；省略协议按 http 处理。留空即直连。<br>
+            <b>保存后直接生效</b>，是否真的通，请点右边「测试连通性」确认。
           </p>
         </div>
         <div class="row">

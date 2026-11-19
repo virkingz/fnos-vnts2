@@ -71,9 +71,11 @@ def main():
         ("https://ghproxy.example.com", False),   # 加速前缀，不是代理 ★
         ("ghproxy.example.com", False),           # 无端口
         ("127.0.0.1", False),                     # 忘了端口
-        ("socks5://127.0.0.1:7891", True),        # 本项目自带 SOCKS5 实现
+        ("socks5://127.0.0.1:7891", True),        # 交给 curl 处理
         ("socks5h://127.0.0.1:1080", True),       # 远端 DNS 语义
-        ("socks4://127.0.0.1:1080", False),       # 只实现 SOCKS5
+        ("socks4://127.0.0.1:1080", True),        # curl 原生支持，放行
+        ("socks4a://127.0.0.1:1080", True),
+        ("socks://127.0.0.1:1080", True),
         ("socks5://127.0.0.1", False),            # 缺端口
         ("ftp://1.2.3.4:21", False),
     ]:
@@ -123,8 +125,12 @@ def main():
 
     # 格式错误仍要拦（这是本地校验，不涉网络）
     res = S.set_proxy("socks4://1.2.3.4:1080")
-    check("非法格式仍被拒", res.get("ok") is False and "SOCKS5" in res.get("error", ""),
+    check("socks4 已放行（交给 curl）", res.get("ok") is True, res)
+    res = S.set_proxy("ftp://1.2.3.4:21")
+    check("非法协议仍被拒", res.get("ok") is False and "支持" in res.get("error", ""),
           res.get("error"))
+    res = S.set_proxy("socks5://1.2.3.4")
+    check("缺端口仍被拒", res.get("ok") is False, res.get("error"))
 
     S._open = real_open
 

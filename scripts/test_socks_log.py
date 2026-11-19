@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SOCKS5 代理支持与核心日志配置的测试。
+"""代理（curl 方案）与核心日志配置的测试。
 
 全部在**回环**内完成：自建「假 SOCKS5 代理 + 假目标服务器」验证链路，
 不访问外网、不依赖真实代理软件。
 
 覆盖：
-  - SOCKS5 协议报文（握手 / CONNECT / 三种 ATYP / 错误码翻译）
-  - socks5 与 socks5h 的语义差异（本地解析 vs 远端解析）
-  - 本地中转让 urllib 可用（这是 urllib 唯一能接 SOCKS 的方式）
-  - 中转服务器在请求结束后被关闭（不泄漏监听端口）
-  - 代理校验：接受 socks5/socks5h，拒绝 socks4
+  - 有代理时一律走 curl（http/https/socks5/socks5h/socks4 行为一致）
+  - curl 参数：--proxy 与 --noproxy 空串（后者防 NO_PROXY 把代理绕掉）
+  - 无代理时走 urllib 直连，且清掉环境变量里的 http_proxy
+  - 代理校验：放行 socks5/socks5h/socks4/socks4a/http，缺端口或非法协议被拒
   - 日志级别 / 大小 / 份数写入 log4rs.yaml，非法值被拒
   - trim 不再截断 vnts2.log（修掉的面板与核心轮转冲突）
 """
@@ -159,244 +158,145 @@ def start_socks(record=None, reply=0x00):
     return port
 
 
-import socks5 as S  # noqa: E402  (需在 sys.path 设置后导入)
+import shell_server as P  # noqa: E402  (需在 sys.path 设置后导入)
 
 # ===========================================================================
 print("=" * 66)
-print("[1] SOCKS5 协议：握手与 CONNECT")
+print("[1] 有代理时一律交给 curl（不再自实现 SOCKS5 协议栈）")
 # ===========================================================================
-tport = start_target(b"HELLO")
-rec = {}
-pport = start_socks(record=rec)
+# 背景：早期版本用「本地回环中转 + 自实现 SOCKS5」走代理，在 Clash 上
+# 表现为 HTTP 代理正常、SOCKS5 报 554。改为统一调 curl 后几种协议一致。
+calls = []
 
-sock = S.connect("127.0.0.1", pport, "127.0.0.1", tport, remote_dns=False, timeout=5)
-check("握手字节正确（VER=5, 1 种方法, 无认证）", rec["hello"] == b"\x05\x01\x00", rec["hello"])
-check("CONNECT 请求头正确（VER=5, CMD=1, RSV=0）", rec["req"][:3] == b"\x05\x01\x00", rec["req"])
-check("目标为 IPv4（ATYP=1）", rec["dest"][2] == 1, rec["dest"])
 
-sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-got = sock.recv(200)
-check("隧道可双向传输", b"HELLO" in got, got[:40])
-sock.close()
+def fake_run_factory(code=200, body=b"ok", rc=0, err=b""):
+    def fake_run(args, **kw):
+        calls.append(args)
 
-# ===========================================================================
-print("\n[2] socks5 vs socks5h：域名解析位置")
-# ===========================================================================
-rec2 = {}
-p2 = start_socks(record=rec2)
-# socks5h：域名原样交给代理（ATYP=3）
+        class R:
+            returncode = rc
+            stdout = body + b"\n" + str(code).encode()
+            stderr = err
+
+        return R()
+
+    return fake_run
+
+
+real_run = P.subprocess.run
+real_find = P.find_curl
 try:
-    s = S.connect("127.0.0.1", p2, "internal.example.com", 443,
-                  remote_dns=True, timeout=5)
-    s.close()
-except S.SocksError:
-    pass
-check("socks5h 把域名原样交给代理（ATYP=3）", rec2["dest"][2] == 3, rec2["dest"])
-check("socks5h 域名未被本地改写", rec2["dest"][0] == "internal.example.com", rec2["dest"])
-check("socks5h 端口正确传递", rec2["dest"][1] == 443, rec2["dest"])
+    P.find_curl = lambda: "/usr/bin/curl"
 
-rec3 = {}
-p3 = start_socks(record=rec3)
-try:
-    s = S.connect("127.0.0.1", p3, "127.0.0.1", 80, remote_dns=False, timeout=5)
-    s.close()
-except S.SocksError:
-    pass
-check("socks5 本地解析为 IP（ATYP=1）", rec3["dest"][2] == 1, rec3["dest"])
+    for px in ("http://127.0.0.1:7890", "socks5://127.0.0.1:1081",
+               "socks5h://127.0.0.1:1081", "socks4://127.0.0.1:1080",
+               "socks4a://127.0.0.1:1080"):
+        calls[:] = []
+        P.subprocess.run = fake_run_factory()
+        with P._open("https://example.com/x", timeout=5, proxy=px) as r:
+            r.read()
+        args = calls[0]
+        check("%-26s 走 curl 且带 --proxy" % px,
+              args[0] == "/usr/bin/curl" and "--proxy" in args and px in args,
+              args[:3])
+        # NO_PROXY 环境变量会让 curl 绕过代理直连 —— 必须显式关掉
+        check("%-26s 带 --noproxy 空串（防绕过）" % px,
+              "--noproxy" in args and args[args.index("--noproxy") + 1] == "",
+              args)
 
-# ===========================================================================
-print("\n[3] 错误码与异常翻译")
-# ===========================================================================
-for code, keyword in [(0x04, "主机不可达"), (0x05, "连接被拒绝"), (0x02, "规则不允许")]:
-    rec4 = {}
-    pp = start_socks(record=rec4, reply=code)
+    # 无代理时不走 curl
+    calls[:] = []
+    P.subprocess.run = fake_run_factory()
     try:
-        S.connect("127.0.0.1", pp, "x.example.com", 80, remote_dns=True, timeout=5)
-        check("reply=0x%02x 应抛错" % code, False, "未抛错")
-    except S.SocksError as e:
-        check("reply=0x%02x 翻译为「%s」" % (code, keyword), keyword in str(e), str(e))
+        P._open("http://127.0.0.1:1/", timeout=1, proxy="")
+    except Exception:  # noqa: BLE001
+        pass
+    check("无代理时不调 curl", calls == [], calls)
 
-# 非 SOCKS 服务
-plain = socket.socket()
-plain.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-plain.bind(("127.0.0.1", 0))
-plain.listen(4)
-plain_port = plain.getsockname()[1]
+    # curl 返回非 0 → 抛出可读错误
+    P.subprocess.run = fake_run_factory(rc=7, err=b"curl: (7) Failed to connect")
+    try:
+        P._open("https://example.com/", timeout=5, proxy="socks5h://127.0.0.1:1")
+        check("curl 失败应抛错", False)
+    except Exception as e:  # noqa: BLE001
+        check("curl 失败抛可读错误", "curl" in str(e), str(e)[:80])
 
-
-def plain_serve():
-    while True:
-        try:
-            c, _ = plain.accept()
-        except OSError:
-            return
-        try:
-            recvn(c, 3)
-            c.sendall(b"\x04\x00")       # 版本 4 —— 不是 SOCKS5
-        except OSError:
-            pass
-        finally:
-            try:
-                c.close()
-            except OSError:
-                pass
-threading.Thread(target=plain_serve, daemon=True).start()
-try:
-    S.connect("127.0.0.1", plain_port, "x", 80, timeout=5)
-    check("非 SOCKS5 服务应抛错", False)
-except S.SocksError as e:
-    check("非 SOCKS5 服务给出明确提示", "不是 SOCKS5" in str(e), str(e))
-
-# 代理完全不可达
-dead = socket.socket()
-dead.bind(("127.0.0.1", 0))
-dead_port = dead.getsockname()[1]
-dead.close()
-try:
-    S.connect("127.0.0.1", dead_port, "x", 80, timeout=3)
-    check("代理不可达应抛错", False)
-except S.SocksError as e:
-    check("代理不可达给出明确提示", "无法连接" in str(e), str(e))
-
-# 要求认证
-auth = socket.socket()
-auth.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-auth.bind(("127.0.0.1", 0))
-auth.listen(4)
-auth_port = auth.getsockname()[1]
-
-
-def auth_serve():
-    while True:
-        try:
-            c, _ = auth.accept()
-        except OSError:
-            return
-        try:
-            recvn(c, 3)
-            c.sendall(b"\x05\x02")       # 只支持用户名密码认证
-        except OSError:
-            pass
-        finally:
-            try:
-                c.close()
-            except OSError:
-                pass
-threading.Thread(target=auth_serve, daemon=True).start()
-try:
-    S.connect("127.0.0.1", auth_port, "x", 80, timeout=5)
-    check("要求认证应抛错", False)
-except S.SocksError as e:
-    check("要求认证给出明确提示", "认证" in str(e), str(e))
+    # 找不到 curl → 明确提示
+    P.find_curl = lambda: ""
+    try:
+        P._open("https://example.com/", timeout=5, proxy="socks5h://127.0.0.1:1")
+        check("缺 curl 应抛错", False)
+    except Exception as e:  # noqa: BLE001
+        check("缺 curl 时给出明确提示", "curl" in str(e), str(e)[:80])
+finally:
+    P.subprocess.run = real_run
+    P.find_curl = real_find
 
 # ===========================================================================
-print("\n[4] 本地中转：让 urllib 能走 SOCKS5")
+print("\n[2] 响应包装：status / read / geturl / 上下文管理")
 # ===========================================================================
-# ⚠ 注意：不能拿 127.0.0.1 当 urllib 的目标来测。
-# urllib 会查 no_proxy/proxy_bypass，而 no_proxy 通常含 127.0.0.1/localhost，
-# 于是请求**直连**、根本不经过代理（这是 no_proxy 的预期行为）。
-# 真实使用中目标都是 github.com 这类外部域名，不受影响。
-# 因此这里用 SOCKS5 协议直连来验证中继的转发行为。
-rec5 = {}
-p5 = start_socks(record=rec5)
-relay = S.SocksRelayServer("127.0.0.1", p5, remote_dns=True)
-lport = relay.start()
-check("中转服务器已监听", lport > 0, lport)
-
-# 直接对中转发 CONNECT（这就是 urllib 会做的事），目标用非本机域名
-c = socket.create_connection(("127.0.0.1", lport), timeout=5)
-c.sendall(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
-resp = c.recv(200)
-check("中转对 CONNECT 回 200", b"200" in resp, resp[:60])
-
-for _ in range(50):
-    if rec5.get("dest"):
-        break
-    time.sleep(0.02)
-check("中转把 CONNECT 目标交给了 SOCKS5", rec5.get("dest") is not None, rec5.get("dest"))
-check("交给代理的是目标域名与端口（不是中转端口）",
-      (rec5.get("dest") or ("", 0, 0))[:2] == ("example.com", 443),
-      (rec5.get("dest"), lport))
-check("socks5h 语义下 ATYP 为域名", (rec5.get("dest") or ("", 0, 0))[2] == 3, rec5.get("dest"))
-try:
-    c.close()
-except OSError:
-    pass
-relay.stop()
-
-# 中转回 200 后，字节应当在隧道里双向流动（用真实目标验证）
-target3 = start_target(b"TUNNEL-OK")
-rec6 = {}
-p6 = start_socks(record=rec6)
-relay_b = S.SocksRelayServer("127.0.0.1", p6, remote_dns=False)
-lpb = relay_b.start()
-cb = socket.create_connection(("127.0.0.1", lpb), timeout=5)
-cb.sendall(("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n" % target3).encode())
-head = cb.recv(200)
-check("中转到本机目标也回 200", b"200" in head, head[:60])
-cb.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-body = b""
-try:
-    while True:
-        d = cb.recv(4096)
-        if not d:
-            break
-        body += d
-except OSError:
-    pass
-check("隧道内可完成完整 HTTP 往返", b"TUNNEL-OK" in body, body[-30:])
-try:
-    cb.close()
-except OSError:
-    pass
-relay_b.stop()
-
-# 连续两次请求：验证 stop 后端口仍可正常重建（不泄漏）
-relay2 = S.SocksRelayServer("127.0.0.1", p5, remote_dns=True)
-lp2 = relay2.start()
-check("中转可重建（端口独立分配）", lp2 > 0 and lp2 != lport, (lport, lp2))
-relay2.stop()
+resp = P._CurlResponse(200, b"abcdef", "https://x/y")
+check("status 可读", resp.status == 200 and resp.code == 200)
+check("read() 全量", resp.read() == b"abcdef")
+check("read(n) 分段", P._CurlResponse(200, b"abcdef", "u").read(2) == b"ab")
+r2 = P._CurlResponse(200, b"abcdef", "u")
+r2.read(2)
+check("read(n) 续读", r2.read(2) == b"cd")
+check("geturl 返回原地址", resp.geturl() == "https://x/y")
+with P._CurlResponse(200, b"x", "u") as rr:
+    check("支持上下文管理", rr.status == 200)
 
 # ===========================================================================
-print("\n[5] 非 CONNECT 请求被拒")
+print("\n[3] 代理校验：放行 socks4，拒绝非法协议与缺端口")
 # ===========================================================================
-relay3 = S.SocksRelayServer("127.0.0.1", p5, remote_dns=True)
-lp3 = relay3.start()
-try:
-    c = socket.create_connection(("127.0.0.1", lp3), timeout=5)
-    c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-    resp = c.recv(200)
-    check("非 CONNECT 返回 405", b"405" in resp, resp[:40])
-    c.close()
-except OSError as e:
-    check("非 CONNECT 返回 405", False, str(e))
-relay3.stop()
-
-# ===========================================================================
-print("\n[6] 代理校验：接受 socks5/socks5h，拒绝 socks4")
-# ===========================================================================
-base = tempfile.mkdtemp(prefix="vnts-log-")
-os.environ["VNT_PKGVAR"] = os.path.join(base, "var")
-os.environ["VNT_APPDEST"] = os.path.join(base, "app")
-os.environ["LOG_DIR"] = os.path.join(base, "log")
-import shell_server as P  # noqa: E402
-
-for raw, want_ok in [("socks5://127.0.0.1:7891", True),
-                     ("socks5h://127.0.0.1:7891", True),
-                     ("socks4://127.0.0.1:1080", False),
-                     ("socks5://127.0.0.1", False),
-                     ("http://127.0.0.1:7890", True)]:
+for raw, want_ok in [
+    ("socks5://127.0.0.1:7891", True),
+    ("socks5h://127.0.0.1:1080", True),
+    ("socks4://127.0.0.1:1080", True),
+    ("socks4a://127.0.0.1:1080", True),
+    ("http://127.0.0.1:7890", True),
+    ("socks5://127.0.0.1", False),
+    ("ftp://1.2.3.4:21", False),
+]:
     addr, err = P.normalize_proxy(raw)
     check("%-28s -> %s" % (raw, "合法" if not err else "拒绝"),
           (not err) == want_ok, err or addr)
 
 check("socks 判定函数正确", P._is_socks("socks5://x:1") and P._is_socks("SOCKS5H://x:1"))
+check("socks4 也归入 socks 系", P._is_socks("socks4://x:1"))
 check("http 不被误判为 socks", not P._is_socks("http://x:1"))
+
+# 无 curl 时的降级：HTTP 代理回去走 urllib；SOCKS 代理必须明确报错
+real_find2 = P.find_curl
+try:
+    P.find_curl = lambda: ""
+    # HTTP 代理 + 无 curl → 降级到 urllib（会因端口没人监听而失败，
+    # 但错误信息不应是「未找到 curl」）
+    try:
+        P._open("http://127.0.0.1:1/", timeout=1, proxy="http://127.0.0.1:2")
+        check("HTTP 代理无 curl 时降级", False, "不该成功")
+    except Exception as e:  # noqa: BLE001
+        check("HTTP 代理无 curl 时降级到 urllib（非缺少 curl 的错）",
+              "未找到 curl" not in str(e), str(e)[:70])
+    # SOCKS 代理 + 无 curl → 必须明确提示缺 curl
+    try:
+        P._open("http://127.0.0.1:1/", timeout=1, proxy="socks5h://127.0.0.1:2")
+        check("SOCKS 无 curl 应报错", False)
+    except Exception as e:  # noqa: BLE001
+        check("SOCKS 无 curl 时提示明确", "curl" in str(e), str(e)[:70])
+finally:
+    P.find_curl = real_find2
 
 # ===========================================================================
 print("\n[7] 日志级别 / 轮转可配置")
 # ===========================================================================
 P.ensure_dirs()
+# 先清掉可能残留的日志配置，确保从「默认值」开始断言：
+# 本文件后续小节（[9]）会把配置改成 512KB 等值，若顺序变化会污染默认值断言。
+try:
+    os.remove(P.LOG_CONF_FILE)
+except OSError:
+    pass
 P.render_config()
 conf = P.load_log_conf()
 check("默认级别为 info", conf["level"] == "info", conf)
