@@ -1,4 +1,42 @@
-build/
+# 构建上下文排除项：只让 Dockerfile 真正需要的文件进入 context。
+# 目的有二：① 减小上下文体积、加快构建；② 避免把与本镜像无关的东西
+# （fpk 包、测试脚本、文档）误打进去。
+
+# Git 与 CI
 .git/
+.gitignore
+.gitattributes
+.github/
+
+# 构建产物（fpk 由 pack.sh 现场生成，不该进 Docker 镜像）
+build/
 *.fpk
+*.zip
+
+# Python 缓存（Dockerfile 里另有一道清理，这里先挡掉）
 __pycache__/
+*.py[cod]
+
+# 测试与开发脚本：镜像里只需要 scripts/gen_icons.py
+# 注意：必须写 scripts/*（排除内容）而不是 scripts/（排除目录本身）——
+# Docker 无法在"被排除的目录"下重新包含子文件。
+scripts/*
+!scripts/gen_icons.py
+
+# 文档与示例：不进镜像
+*.md
+LICENSE
+CHANGELOG.md
+README.md
+
+# 飞牛插件专属（Docker 版不需要）
+cmd/
+wizard/
+manifest
+config/
+app/ui/config
+
+# Docker 目录只保留两个脚本
+docker/*.yml
+docker/*.yaml
+docker/README.md

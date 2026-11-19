@@ -105,3 +105,36 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+
+      # 冒烟测试：只为本机架构单独构建一份（多架构那份推走了、不便直接跑），
+      # 然后在容器里实跑 docker/smoke-test.sh。
+      #
+      # 为什么必须在容器里跑一遍：Dockerfile 删掉了 ensurepip /
+      # unittest / multiprocessing 等标准库模块。这类删除在**构建期不会报错**，
+      # 风险全在运行时才暴露（某模块被间接 import 才发现缺失）。
+      # 本机没有 Docker，因此把这道验证放在 CI 里。
+      - name: 为冒烟测试构建本机架构镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: fnos-vnts2:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 容器冒烟测试（验证精简后的 Python 环境功能完好）
+        # 必须用 --entrypoint 覆盖镜像自带的入口：
+        # 镜像 ENTRYPOINT 是 `tini -- entrypoint.sh`，而 entrypoint.sh 结尾
+        # 是 `wait "$child"`（守护后端，常驻不退），且**不转发 "$@"** ——
+        # 直接 `docker run 镜像 sh /t/smoke-test.sh` 的话，我们传的命令会被
+        # 完全忽略，容器只会跑起后端并一直挂着，CI 便卡在那里直到超时。
+        # 加 timeout 兜底：万一脚本自身卡住，也不要拖满 6 小时配额。
+        run: |
+          timeout 180 docker run --rm \
+            --entrypoint sh \
+            -v "$PWD/docker:/t:ro" \
+            fnos-vnts2:smoke \
+            /t/smoke-test.sh

@@ -89,6 +89,27 @@ vnts2 用 `SocketAddr` 解析 `peer_servers`，**只接受字面 `IP:端口`**�
 
 ### 变更
 
+- **Docker 镜像压缩：22.2MB → 18.2MB（-18%），层数 12 → 4**。
+  逐项核实后做了三件事：
+  - **去掉 openssl CLI**（省 0.77MB）：原注释写「用 openssl 生成令牌」，
+    但令牌实际由 Python 的 `secrets.token_hex` 生成，全项目没有一处调用
+    openssl 命令。ssl **库**（libssl3/libcrypto3）仍随 python3 依赖带入 ——
+    下载核心走 https 必须它，能力不减。
+  - **精简 Python 标准库**（省约 3.1MB）：删掉 ensurepip（自带 pip wheel）、
+    lib2to3、pydoc_data、idlelib、tkinter、unittest、multiprocessing、
+    distutils、config-3.12、test。删前用 `sys.modules` 实测确认导入本项目
+    全部模块后它们一个都没被加载。
+  - **合并到单层**：Docker 的删除只是联合文件系统的 whiteout 标记，
+    **底层数据仍留在上一层** —— 若把 `apk add` 与 `rm -rf` 分在两条 RUN，
+    删掉的文件照样占体积（实测只省 0.34MB）。合成一条 RUN 后才真正省下 3.1MB。
+    代码改用 `--mount=type=bind` 读入，不占层，因此改代码不会让 apk 层失效。
+- **`tzdata` 保留**：`TZ=Asia/Shanghai` 生效依赖它（日志时间戳显示 +08:00），
+  而它压缩后仅 0.19MB，收益太小、不值得冒时区错乱的风险。
+- **CI 增加容器冒烟测试**：构建后在本机架构镜像里实跑 `docker/smoke-test.sh`，
+  验证精简后的 Python 环境功能完好（标准库完整、ssl 与根证书可用、
+  被删模块确实移除、管理页能起来并响应健康检查）。共 33 项。
+  为什么必须放在容器里跑：这类删除**构建期不会报错**，风险全在运行时才暴露。
+
 - **代理改用 curl 实现（与 fnos-vnt2 一致），修掉 SOCKS5 报 HTTP 554**：
   切到「下载源与代理」填 `socks5://` 或 `socks5h://` 时，Clash 系代理会返回
   `HTTP 554`，而同一个代理用 `http://` 却正常。原因是早期版本自己实现了一套
