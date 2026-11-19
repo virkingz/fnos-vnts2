@@ -112,6 +112,24 @@ vnts2 用 `SocketAddr` 解析 `peer_servers`，**只接受字面 `IP:端口`**�
 
 ### 修复
 
+- **卸载重装后核心起不来（`Address in use` / os error 98）**：三道防线都太窄，
+  一起补齐。
+  - **排查范围太窄**：启动前只检查控制台端口（29071），而核心实际会 bind
+    多个端口 —— `tcp_bind`/`quic_bind`/`ws_bind`（默认 29872）、`web_bind`
+    （29071）、`server_quic_bind`（29873）。组网端口被孤儿进程占着、控制台
+    端口恰好空着时会被误判为「无冲突」，核心一 bind 就崩。现在统一用
+    `core_bind_ports()` 枚举全部端口。
+  - **UDP 是探测盲区**：`connect_ex` 只能测 TCP，而 quic 与 server_quic 走
+    **UDP** —— 实测 UDP 已占用时 TCP 探测返回非 0（误判为空闲）。新增
+    `udp_port_in_use()` 单独测，`describe_port_conflicts()` 同时报 tcp/udp。
+  - **卸载/停机只信 pid 文件**：`vnt_stop_core` 在 pid 文件丢失时直接返回，
+    留下孤儿进程占着端口。现在增加兜底 `vnt_kill_core_stragglers()`：
+    按**进程名 + 端口**（tcp/udp 都试）再清一遍，并等端口真正释放。
+    卸载、配置变更、升级三条路径都先 `vnt_load_ports` 再停核心。
+  - **失败提示更可用**：核心因 `Address in use` 退出时，直接指出哪些端口被占、
+    并提示去「服务端设置」换号，而不是只甩一段日志。
+
+
 - **导入配置后出站互联域名没生效**：两个原因，一起修了。
   1. 同步时机错位：`import_bundle` 里先同步、HTTP 层随后才重启核心，
      重启后核心又从 SQLite 重新加载，同步结果被覆盖。

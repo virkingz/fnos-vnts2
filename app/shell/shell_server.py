@@ -1276,43 +1276,127 @@ def port_in_use(port, timeout=1.5):
             pass
 
 
+def udp_port_in_use(port, timeout=0.5):
+    """UDP 端口是否已被占用（本地回环）。
+
+    为什么必须单独测：核心的 quic 与 server_quic（互联信令）都走 **UDP**，
+    而 TCP 的 connect_ex 对 UDP 绑定完全无感（实测返回非 0 = 误判为空闲）。
+    只测 TCP 就会漏掉 UDP 冲突，核心起来后 bind 失败并立刻退出。
+    """
+    import socket as _s
+    s = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+    try:
+        # 已被别人独占绑定（无 SO_REUSEADDR）时，bind 会失败
+        s.bind(("127.0.0.1", int(port)))
+        return False
+    except OSError:
+        return True
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def core_bind_ports():
+    """核心启动时会 bind 的全部端口（去重、排序）。
+
+    **这是「Address in use」的真正排查范围。** 之前只看控制台端口，
+    于是「组网端口被孤儿进程占着、控制台端口空着」时误判为无冲突，
+    核心一起来就 bind 失败。
+
+    实际绑定（见 vnts_config.render_config_toml）：
+      tcp_bind / quic_bind / ws_bind —— 默认同为 SERVICE_PORT
+      web_bind                     —— CONSOLE_PORT
+      server_quic_bind             —— peer_bind_port（默认 29873）
+    """
+    ports = set()
+    try:
+        ports.add(int(load_ports()["SERVICE_PORT"]))
+    except (KeyError, ValueError):
+        pass
+    try:
+        ports.add(int(load_ports()["CONSOLE_PORT"]))
+    except (KeyError, ValueError):
+        pass
+    # 三协议可能各自设了独立端口
+    try:
+        pp = load_proto_ports()
+        for k in ("tcp_port", "quic_port", "ws_port"):
+            v = str(pp.get(k) or "").strip()
+            if v.isdigit():
+                ports.add(int(v))
+    except Exception:  # noqa: BLE001
+        pass
+    # 服务端互联端口
+    try:
+        s = C.load_settings(SERVER_DIR, PORT_FILE)
+        v = int(s.get("peer_bind_port") or 0)
+        if v:
+            ports.add(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return sorted(p for p in ports if p > 0)
+
+
+def describe_port_conflicts(ports=None):
+    """返回 [(port, "tcp"/"udp")]，列出当前被占用的端口。"""
+    out = []
+    for p in (ports if ports is not None else core_bind_ports()):
+        if port_in_use(p):
+            out.append((p, "tcp"))
+        if udp_port_in_use(p):
+            out.append((p, "udp"))
+    return out
+
+
 def _console_port():
     return int(load_ports()["CONSOLE_PORT"])
 
 
 def _kill_stragglers():
-    """清理未记录在 pid 文件、但仍占着控制台端口的残留 vnts2。
+    """清理未记录在 pid 文件、但仍占着端口的残留 vnts2。
 
     这是「端口被占用」的兜底：正常路径下不该有残留，
-    但异常退出（kill -9、容器被杀）可能留下孤儿进程。
+    但异常退出（kill -9、容器被杀、卸载时 pid 文件已丢）都可能留下孤儿。
+
+    排查范围是**核心会 bind 的全部端口**（见 core_bind_ports），
+    而不是只看控制台端口 —— 只查一个会漏掉组网端口被占的情况：
+    那时核心起身读配置都正常，一到 bind 就报 Address in use 并退出。
     """
-    port = _console_port()
-    if not port_in_use(port):
+    ports = core_bind_ports()
+    conflicts = describe_port_conflicts(ports)
+    if not conflicts:
         return
-    log("控制台端口 %d 被占用，尝试清理残留核心进程" % port)
+    desc = "、".join("%d/%s" % (p, k) for p, k in conflicts)
+    log("端口被占用（%s），尝试清理残留核心进程" % desc)
     killed = False
     # 优先按进程名精确匹配，避免误杀其它程序
-    try:
-        r = subprocess.run(["pkill", "-f", os.path.basename(CORE_BIN)],
-                           capture_output=True, timeout=5)
-        killed = r.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        pass
-    if not killed:
-        # 退回到 `fuser -k <port>/tcp`
-        for tool in (["fuser", "-k", "%d/tcp" % port],):
-            try:
-                subprocess.run(tool, capture_output=True, timeout=5)
+    for pat in (os.path.basename(CORE_BIN), "vnts2", "vnts"):
+        try:
+            r = subprocess.run(["pkill", "-f", pat],
+                               capture_output=True, timeout=5)
+            if r.returncode == 0:
                 killed = True
-            except (OSError, subprocess.SubprocessError):
-                pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not killed:
+        # 退回到按端口杀：tcp 与 udp 都要试（quic 走 udp）
+        for p, kind in conflicts:
+            for tool in (["fuser", "-k", "%d/%s" % (p, kind)],):
+                try:
+                    subprocess.run(tool, capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
     # 等待端口释放
     t0 = time.time()
     while time.time() - t0 < 5:
-        if not port_in_use(port):
+        if not describe_port_conflicts(ports):
             return
         time.sleep(0.3)
-    log("WARN: 控制台端口 %d 仍被占用" % port)
+    left = "、".join("%d/%s" % (p, k) for p, k in describe_port_conflicts(ports))
+    if left:
+        log("WARN: 端口仍被占用：%s" % left)
 
 
 def wait_core(up=True, timeout=15):
@@ -1394,10 +1478,13 @@ def _start_core_locked():
     # （报错长相：Error: Address in use (os error 98)）。
     # 必须持锁执行：否则 watcher 会在此刻插入、产生第二个实例。
     _kill_stragglers()
-    if port_in_use(_console_port()):
-        return False, ("控制台端口 %s 已被其它程序占用，无法启动核心。"
-                       "请在「服务端设置」里为该端口换一个号，或先释放它。"
-                       % _console_port())
+    stuck = describe_port_conflicts()
+    if stuck:
+        desc = "、".join("%d/%s" % (p, k) for p, k in stuck)
+        return False, ("端口已被占用，无法启动核心：%s。"
+                       "这些是核心要监听的端口（组网 TCP/UDP、控制台、互联）。"
+                       "请先停掉占用它的程序，或到「服务端设置」换端口。"
+                       % desc)
 
     render_config()
     os.makedirs(SERVER_DIR, exist_ok=True)
@@ -1426,6 +1513,17 @@ def _start_core_locked():
     if proc.poll() is not None:
         _rm(CORE_PID_FILE)
         tail = _tail(core_log(), 20)
+        # 「立即退出」最常见的原因是端口被占（日志里的 Address in use）。
+        # 直接点出来并给出可操作建议，比只甩一段日志有用得多。
+        if "Address in use" in tail or "os error 98" in tail:
+            stuck = describe_port_conflicts()
+            hint = ("、".join("%d/%s" % (p, k) for p, k in stuck)
+                    if stuck else "（端口可能刚被释放，请重试）")
+            return False, (
+                "启动失败：端口被占用（%s）。\n"
+                "这是核心要监听的端口。请先停掉占用它的程序；"
+                "或到「服务端设置」里把这些端口改成别的号。\n"
+                "日志尾部：\n%s" % (hint, tail))
         return False, "核心启动后立即退出。日志尾部：\n%s" % tail
     return True, "核心运行中 (pid=%d)" % proc.pid
 

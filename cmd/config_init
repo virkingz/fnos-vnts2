@@ -15,5 +15,7 @@ LIB="${TRIM_APPDEST}/shell/lib.sh"
 . "$LIB"
 
 vnt_paths
+# 先读端口，再停核心：停核心的兜底清理要按端口杀残留（quic 走 UDP）
+vnt_load_ports
 vnt_stop_core || true
 exit 0

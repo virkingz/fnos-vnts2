@@ -270,6 +270,50 @@ def main():
     check("留空不参与冲突检查", not C.validate_proto_ports(dict(base)))
 
     # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+    print("\n[?] 端口冲突检测：覆盖核心会 bind 的全部端口（含 UDP）")
+    # ------------------------------------------------------------------
+    # 真实故障：卸载重装后核心报 `Address in use (os error 98)` 并立即退出。
+    # 根因是两道防线都太窄：
+    #   1) 启动前只查控制台端口（29071），漏掉组网端口 29872/29873；
+    #   2) 用 TCP connect_ex 探测，而 quic / server_quic 走 **UDP**，
+    #      对 UDP 绑定完全无感（实测返回非 0，误判为空闲）。
+    import socket as _sk
+    S.write_file(S.PORT_FILE,
+                 "PANEL_PORT=19098\nSERVICE_PORT=29872\nCONSOLE_PORT=29071\n")
+    ports = S.core_bind_ports()
+    check("枚举到组网与控制台端口", 29872 in ports and 29071 in ports, ports)
+    check("枚举到互联端口 29873", 29873 in ports, ports)
+
+    # TCP 占用组网端口 —— 旧逻辑只看 29071 会漏掉
+    t = _sk.socket(); t.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+    try:
+        t.bind(("127.0.0.1", 29872)); t.listen(16)
+        conflicts = S.describe_port_conflicts()
+        check("组网端口被 TCP 占用时能发现",
+              (29872, "tcp") in conflicts, conflicts)
+        check("只查控制台端口确实会漏（对照）",
+              S.port_in_use(29071) is False)
+    finally:
+        t.close()
+
+    # UDP 占用（quic 走 UDP）—— TCP 探测测不出，必须单独测
+    u = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
+    try:
+        u.bind(("127.0.0.1", 29872))
+        check("UDP 占用时 TCP 探测无感（证明必须单独测 UDP）",
+              S.port_in_use(29872) is False)
+        check("UDP 探测能发现占用", S.udp_port_in_use(29872) is True)
+        check("describe_port_conflicts 报出 udp",
+              (29872, "udp") in S.describe_port_conflicts(),
+              S.describe_port_conflicts())
+    finally:
+        u.close()
+
+    # 干净时不应误报
+    check("无占用时不误报", S.describe_port_conflicts() == [],
+          S.describe_port_conflicts())
+
     print("\n[?] 插件（fpk）与 Docker 的启动一致性")
     # ------------------------------------------------------------------
     # 两个真实故障（都踩过，且症状都是「装了打不开」）：

@@ -407,20 +407,76 @@ vnt_shell_running() {
 vnt_stop_core() {
     local pf pid i
     pf="$(vnt_pid_file)"
-    vnt_core_running || { rm -f "$pf"; return 0; }
-    pid="$(head -n 1 "$pf" | tr -d '[:space:]')"
-    vnt_log "stopping core pid=${pid}"
-    kill -TERM "$pid" 2>/dev/null || true
-    i=0
-    while vnt_core_running && [ $i -lt 15 ]; do
-        sleep 1; i=$((i + 1))
-    done
+
     if vnt_core_running; then
-        kill -KILL "$pid" 2>/dev/null || true
-        sleep 1
+        pid="$(head -n 1 "$pf" | tr -d '[:space:]')"
+        vnt_log "stopping core pid=${pid}"
+        kill -TERM "$pid" 2>/dev/null || true
+        i=0
+        while vnt_core_running && [ $i -lt 15 ]; do
+            sleep 1; i=$((i + 1))
+        done
+        if vnt_core_running; then
+            kill -KILL "$pid" 2>/dev/null || true
+            sleep 1
+        fi
     fi
+
+    # 关键兜底：pid 文件会丢（卸载删数据、异常退出、容器被杀），
+    # 但进程可能还活着并占着端口。只信 pid 文件就会留下孤儿进程，
+    # 重装后新核心起不来，报 Address in use。这里按**进程名 + 端口**再清一遍。
+    vnt_kill_core_stragglers
+
     rm -f "$pf"
     return 0
+}
+
+vnt_kill_core_stragglers() {
+    local pat p kind found=0
+    # 1) 按进程名（核心二进制名可能是 vnts2 或带架构后缀）
+    for pat in vnts2 vnts; do
+        if pgrep -f "$pat" >/dev/null 2>&1; then
+            vnt_log "清理残留核心进程（匹配 $pat）"
+            pkill -TERM -f "$pat" 2>/dev/null || true
+            found=1
+        fi
+    done
+    if [ "$found" = "1" ]; then
+        sleep 2
+        for pat in vnts2 vnts; do
+            pkill -KILL -f "$pat" 2>/dev/null || true
+        done
+    fi
+
+    # 2) 按端口兜底：核心监听组网端口（TCP+UDP）与控制台端口。
+    #    quic 走 UDP，只杀 tcp 会漏。
+    for p in ${SERVICE_PORT:-29872} ${CONSOLE_PORT:-29071}; do
+        [ -n "$p" ] || continue
+        for kind in tcp udp; do
+            if command -v fuser >/dev/null 2>&1; then
+                fuser -k "${p}/${kind}" >/dev/null 2>&1 || true
+            fi
+        done
+    done
+    # 3) 等端口真正释放
+    i=0
+    while [ $i -lt 5 ]; do
+        if ! vnt_port_listening "${SERVICE_PORT:-29872}" && \
+           ! vnt_port_listening "${CONSOLE_PORT:-29071}"; then
+            return 0
+        fi
+        sleep 1; i=$((i + 1))
+    done
+    return 0
+}
+
+vnt_port_listening() {
+    local p="${1:-}"
+    [ -n "$p" ] || return 1
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntu 2>/dev/null | grep -q "[:.]${p}[[:space:]]" && return 0
+    fi
+    return 1
 }
 
 # ---------------------------------------------------------------------------
