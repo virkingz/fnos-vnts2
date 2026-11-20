@@ -780,14 +780,19 @@ class Handler(BaseHTTPRequestHandler):
                 with open(alt, "rb") as f:
                     return self._send(200, f.read(), "image/png")
 
-        # SPA 回退：未知路径交给管理页（index.html），并注入正确的 <base>。
-        # 这样无论应用被挂在 / 还是 /app/vnts-nas（飞牛网关）都能自定位。
-        looks_like_asset = "." in os.path.basename(rel)
-        if not looks_like_asset:
-            idx = os.path.join(WEB_DIR, "index.html")
-            if os.path.isfile(idx):
-                with open(idx, "rb") as f:
-                    return self._send(200, self._inject_base(f.read()), "text/html; charset=utf-8")
+        # 走到这里说明路径没有对应任何真实文件 —— 一律 404。
+        #
+        # 这里原先是「SPA 回退」：任何**不像资源**的路径（basename 不含点）
+        # 都返回 index.html。那是个漏洞 —— 实测 `/test/test`、`/任意/乱写`
+        # 都能打开管理界面（地址栏还是一串无关路径）。
+        #
+        # 之所以能安全去掉回退：前端用的是 **hash 路由**
+        # （app.js: `location.hash = name`，即 #overview / #core 这类），
+        # path 层面从不导航。它对 path 的全部需求只有三样：
+        #   ① `/` 或 `/index.html` 拿到首页 —— 上面已按真实文件返回；
+        #   ② 首页里那几个相对资源（app.js / app.css / icon.png）—— 同理；
+        #   ③ /panel-api/* 与 /console/* —— 在 _route 里单独分支处理，不走这里。
+        # 因此没有未知 path 需要回退，去掉它不影响任何正常使用。
         return self._send(404, "404 Not Found", "text/plain; charset=utf-8")
 
     def _inject_base(self, data):

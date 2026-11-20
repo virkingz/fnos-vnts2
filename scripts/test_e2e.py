@@ -81,6 +81,19 @@ def main():
         check("<base> 已注入", '<base href="/">' in html)
         token = m.group(1) if m else ""
 
+        # 管理页入口限制：只有 / 与真实存在的资源可访问，其余一律 404。
+        # 背景：原先有「SPA 回退」——任何不像资源的路径都返回 index.html，
+        # 于是 /test/test、/任意/乱写 都能打开管理界面（地址栏还是一串无关
+        # 路径）。前端实际用 hash 路由（#overview / #core），path 层面从不
+        # 导航，因此该回退没有合法用途，已去掉。
+        print("\n[1b] 路径限制（非入口路径一律 404）")
+        for okpath in ("/", "/index.html", "/app.js", "/app.css", "/icon.png"):
+            c, _ = get(url + okpath)
+            check("合法路径 %s -> 200" % okpath, c == 200, c)
+        for badpath in ("/test/test", "/foo", "/a/b/c", "/admin", "/foo/"):
+            c, _ = get(url + badpath)
+            check("非法路径 %s -> 404" % badpath, c == 404, c)
+
         print("\n[2] 令牌校验")
         c, _ = get(url + "/panel-api/state")
         check("无令牌 -> 401", c == 401, c)
