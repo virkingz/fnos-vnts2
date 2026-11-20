@@ -87,7 +87,13 @@ def main():
         # 路径）。前端实际用 hash 路由（#overview / #core），path 层面从不
         # 导航，因此该回退没有合法用途，已去掉。
         print("\n[1b] 路径限制（非入口路径一律 404）")
-        for okpath in ("/", "/index.html", "/app.js", "/app.css", "/icon.png"):
+        # 只列**仓库里确实跟踪**的首页资源。
+        # 不断言 /icon.png：它是构建产物（.gitignore 忽略 app/ui/images/icon_*.png
+        # 与 app/shell/web/icon.png），由 gen_icons.py / pack.sh 现场生成。
+        # 而本测试把 app/shell 单独拷到临时目录，_static 回退用的
+        # `web/../../ui/images/` 在那里并不存在 —— 干净检出下它必然 404，
+        # 断言 200 会误报（CI 上确实这么红过一次）。图标另由冒烟测试覆盖。
+        for okpath in ("/", "/index.html", "/app.js", "/app.css"):
             c, _ = get(url + okpath)
             check("合法路径 %s -> 200" % okpath, c == 200, c)
         for badpath in ("/test/test", "/foo", "/a/b/c", "/admin", "/foo/"):
