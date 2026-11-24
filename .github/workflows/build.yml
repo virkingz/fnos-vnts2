@@ -56,6 +56,9 @@ jobs:
           files: fnos-vnts2.fpk
           fail_on_unmatched_files: true
           generate_release_notes: false
+          # tag 里带 "-" 视为预发布（如 v1.0.1-rc.1 -> pre-release=true）。
+          # 这样正式版与预发布版在 Releases 页面天然区分开。
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   docker:
     # 多架构构建走 QEMU，较慢，因此只在打 tag 或手工触发时执行。
@@ -84,15 +87,23 @@ jobs:
         id: meta
         run: |
           IMG="ghcr.io/${GITHUB_REPOSITORY_OWNER}/fnos-vnts2"
-          # tag 推送：版本号 + latest（latest 始终指向最新版本，供 compose 默认拉取）
-          # 其它触发：edge（开发版，不覆盖 latest）
+          # 三级规则：
+          #   tag 且含 "-"（如 v1.0.1-rc.1）-> 只打该版本号，**不动 latest**
+          #     （预发布不该让 compose 默认拉 latest 的用户自动升级）
+          #   tag 且不含 "-"           -> 版本号 + latest
+          #   其它触发（分支/手动）     -> edge（开发版，不覆盖 latest）
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            {
-              echo "tags<<EOF"
-              echo "${IMG}:${GITHUB_REF_NAME}"
-              echo "${IMG}:latest"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
+            if [ "${GITHUB_REF_NAME#*-}" != "${GITHUB_REF_NAME}" ]; then
+              echo "tags=${IMG}:${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+              echo "::notice::预发布 tag，仅推送 ${GITHUB_REF_NAME}，不改动 latest"
+            else
+              {
+                echo "tags<<EOF"
+                echo "${IMG}:${GITHUB_REF_NAME}"
+                echo "${IMG}:latest"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "tags=${IMG}:edge" >> "$GITHUB_OUTPUT"
           fi

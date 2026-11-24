@@ -10,6 +10,8 @@
 #
 # 【固定版本】
 #   把 image 的 :latest 换成具体版本，如 :v1.0.0
+#   注意：预发布版（带 -rc 等后缀）**不会更新 latest** ，要试新版须显式指定，
+#   例如 image: ghcr.io/virkingz/fnos-vnts2:v1.0.1-rc.1
 #
 # 端口说明：
 #   19098/tcp  管理页（含内嵌控制台）
