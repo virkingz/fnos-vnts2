@@ -7,12 +7,12 @@
 > 网关前缀为 `/app/vnts-nas`。两者刻意不同，便于与其他 `fnos-*` 项目命名统一，
 > 同时不影响既有安装路径。
 
-## [1.0.1-rc.1] - 2026-11-24
+## [1.0.1-rc.2] - 2026-11-24
 
-**预发布版本**（GitHub tag `v1.0.1-rc.1`，Release 标记为 pre-release）。
+**预发布版本**（GitHub tag `v1.0.1-rc.2`，Release 标记为 pre-release）。
 
 > 说明：飞牛 fpk 内的版本号写作纯数字 `1.0.1`（fnOS 的 manifest 版本比较
-> 只用三段数字最稳妥）；`-rc.1` 这一预发布标记只体现在 GitHub 与 Docker 上。
+> 只用三段数字最稳妥）；`-rc.N` 这一预发布标记只体现在 GitHub 与 Docker 上。
 
 ### 安全
 

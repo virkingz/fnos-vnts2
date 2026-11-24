@@ -15,4 +15,4 @@ checkport = false
 ctl_stop = true
 desktop_uidir = ui
 desktop_applaunchname = vnts-nas.main
-changelog = v1.0.1（预发布）：限制管理页入口，不再对任意路径返回首页（此前 /test/test 等无关路径也能打开管理界面，且会把令牌注入给这些请求）；补充公网访问与安全说明（反代认证仅在管理页端口不直接对外时才有效）。
+changelog = v1.0.1（预发布 rc.2）：出站互联改为读核心数据库取全量名单——修复「连不上、因而不出现在接口里的互联记录清不掉」的问题（现在能彻底按本页清单对账）；限制管理页入口，不再对任意路径返回首页；补充公网访问与安全说明。
