@@ -40,6 +40,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -491,7 +492,68 @@ class ConsoleClient(object):
 # ---------------------------------------------------------------------------
 # 单轮同步（本模块的核心，全部纯度可测）
 # ---------------------------------------------------------------------------
-def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
+# ---------------------------------------------------------------------------
+# 直接读核心数据库（**只读**，用于拿到「连不上」的隐藏记录）
+# ---------------------------------------------------------------------------
+# 为什么必须读库、而不能靠 API 枚举：
+#
+#   实测 v2.0.9：POST 一个连不上的地址会「添加成功」并写进 SQLite，但
+#   `GET /api/peer_servers` 的 outbound 只包含**当前连上的**（每项带
+#   connected/latency_ms），所以这些记录**永远不出现在接口里**。
+#   重启核心也不管用 —— 日志里能看到它确实 load 并开始重连
+#   （"Starting outbound connection to: ... (source: Manual)"），
+#   但 API 响应依旧为空。于是「以 API 为准」的对账**永远删不掉它们**。
+#
+#   唯一能拿到完整名单的地方是核心自己的 SQLite：
+#       CREATE TABLE peer_servers (
+#           id INTEGER PRIMARY KEY AUTOINCREMENT,
+#           server_addr TEXT NOT NULL UNIQUE,
+#           source INTEGER NOT NULL DEFAULT 0,
+#           created_at INTEGER NOT NULL)
+#   其中 source：1 = Manual（控制台/API 手工添加，日志实证）。
+#
+# 安全约束：**只读**。用 URI 的 mode=ro 打开，SQLite 会拒绝对它的任何写入
+# （收 OperationalError: attempt to write a readonly database），
+# 从机制上保证我们不会破坏核心的数据。
+def db_peer_addrs(db_path, _connect=None):
+    """读核心数据库中**全部**已注册的出站地址。返回 (addrs, error)。
+
+    返回的是有序去重列表（按 created_at）。任何异常都退化成 ([], 原因)，
+    调用方据此降级为「只用 API 能看到的地址」，绝不因此中断同步。
+    """
+    if not db_path or not os.path.isfile(db_path):
+        return [], "数据库不存在"
+    try:
+        if _connect is not None:
+            conn = _connect(db_path)
+        else:
+            # mode=ro：只读打开。Windows 下路径要转成 file:// URI 的正斜杠形式。
+            uri = "file:%s?mode=ro" % urllib.parse.quote(
+                os.path.abspath(db_path).replace("\\", "/"), safe="/:")
+            conn = sqlite3.connect(uri, uri=True, timeout=5)
+    except Exception as e:  # noqa: BLE001
+        return [], "无法打开数据库: %s" % e
+    try:
+        rows = conn.execute(
+            "SELECT server_addr FROM peer_servers ORDER BY created_at"
+        ).fetchall()
+    except Exception as e:  # noqa: BLE001
+        return [], "读取 peer_servers 失败: %s" % e
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    out, seen = [], set()
+    for r in rows:
+        a = str((r[0] if r else "") or "").strip()
+        if a and a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out, ""
+
+
+def sync_once(doc, client, now=None, _getaddrinfo=None, log=None, db_addrs=None):
     """按配置清单与核心**实际注册过的**出站地址做一轮完全对账，原地修改 doc。
 
     返回 actions 列表。每项形如：
@@ -508,8 +570,13 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
       - 让「以 GET 为准」的对账每轮重复 add → 核心回「已存在」→ 永久刷错误；
       - 清理阶段看不见它 → **永远删不掉，清空清单也删不掉**。
 
-    所以：**判定基准取 `GET 列表 ∪ doc["managed"]`**，两者哪个都不完整，
-    合起来才能覆盖「连上的」「没连上的」两种已注册地址。
+    所以判定基准取 **`db_addrs ∪ GET 列表 ∪ doc["managed"]`**：
+      - `db_addrs`（由 db_peer_addrs 只读数据库得到）是**唯一**能覆盖
+        「已注册但连不上」的来源 —— 实测重启核心也不会让它们出现在 GET 里
+        （日志有 "Starting outbound connection to: ..." 但 API 仍为空）；
+      - `GET 列表` 覆盖 `persistence=false`（无数据库）或刚 add 进内存、
+        尚未落盘的瞬间；
+      - `managed` 覆盖数据库不可读时（权限/文件损坏）的降级场景。
 
     ## 如何区分「已登记但没连上」与「已被删掉」
 
@@ -525,8 +592,8 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
       - 否则尝试 add；「已存在」视为成功。
       - 该条旧地址 cur 已不再需要 → 删除。add 失败时绝不删 cur（否则互联会断）。
     阶段二：删除「已注册但本轮不再需要」的地址，即
-      `(GET列表 ∪ managed) - 目标集 - 本轮需保护的旧地址`。
-      这是「从有到无」的落点，且因为不依赖 GET 列表，连不上的残留照样能删掉。
+      `(db_addrs ∪ GET列表 ∪ managed) - 目标集 - 本轮需保护的旧地址`。
+      这是「从有到无」的落点；因为纳入 db_addrs，**连不上的残留也能删掉**。
 
     安全约束：不碰 inbound（别的服务端连进来的，不在 GET 的 outbound 里），
     也不误删用户在控制台手工添加且仍需要的地址。
@@ -549,23 +616,31 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
                             "addr": "", "msg": err})
         return actions
 
+    # 数据库里的全部已注册地址（含 GET 看不到的「连不上」记录）。
+    # db_addrs 由调用方读取后传入，便于纯函数测试；为 None 时视为「不可用」。
+    known_db = set(db_addrs or [])
+
     def _del(addr, host, msg):
         """删除已注册地址。返回是否成功。"""
         ok, derr = client.del_peer(addr)
         if ok:
             if addr in out_addrs:
                 out_addrs.remove(addr)
+            known_db.discard(addr)
             actions.append({"host": host, "action": "del", "addr": addr, "msg": msg})
             return True
         actions.append({"host": host, "action": "error", "addr": addr, "msg": derr})
         return False
 
     # ---- 清单为空：撤下所有登记过的地址（从有到无的关键路径）----
-    # 基准取「managed ∪ 连上的出站地址」：前者覆盖连不上的死记录，
-    # 后者覆盖用户在控制台手工加的（用户要求以本页配置为准）。
+    # 基准取「db ∪ managed ∪ 连上的出站地址」：三者都不完整 ——
+    #   db      覆盖「已注册但连不上」的死记录（唯一来源）
+    #   managed  数据库不可读时的降级依据
+    #   out_addrs 覆盖刚 add 进内存、尚未落盘的那一瞬间
+    # 合起来才能覆盖所有「核心认为已登记」的地址。
     if not records:
         keep = []
-        for addr in sorted(set(managed) | set(out_addrs)):
+        for addr in sorted(known_db | set(managed) | set(out_addrs)):
             if _del(addr, "", "清单已清空，撤下托管地址"):
                 _log("清单已清空，撤下托管地址：%s" % addr)
             else:
@@ -632,9 +707,10 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
                 continue
 
         # 目标已就位，再撤下该条已不用的旧地址。
-        # 仅当它确实还注册着（在已连列表或 managed 里）才调删除 —— 否则会
+        # 仅当它确实还注册着（在库/已连列表/managed 里）才调删除 —— 否则会
         # 对早被删掉的地址反复发 DELETE，既多余又刷日志。
-        if cur and cur != want and (cur in out_addrs or cur in managed_set):
+        if cur and cur != want and (cur in out_addrs or cur in managed_set
+                                    or cur in known_db):
             if _del(cur, host, "旧地址已被新 IP 取代"):
                 rec["previous"] = cur
                 managed_set.discard(cur)
@@ -648,23 +724,12 @@ def sync_once(doc, client, now=None, _getaddrinfo=None, log=None):
         rec["last_error"] = ""
 
     # ---- 阶段二：撤下「已注册但本轮不再需要」的地址 ----
-    # 覆盖：先加新未删旧就重启核心留下的残留、控制台手工增删造成的偏差、
-    # 以及**连不上因此从不出现在 GET 列表里的死记录**。
+    # 覆盖：先加新未删旧留下的残留、控制台手工增删造成的偏差、以及
+    # **连不上因此从不出现在 GET 列表里的死记录**（靠 known_db 才能看到）。
     #
-    # out_addrs 里已被阶段一删掉的地址不会重复处理：_del 成功时会从
-    # out_addrs 移除，to_clean 因此不会再包含它。
-    to_clean = (set(out_addrs) | managed_set) - target - protect
-    for addr in sorted(to_clean):
-        if _del(addr, "", "不在配置清单中，已清理"):
-            managed_set.discard(addr)
-            _log("清理多余互联地址：%s（不在配置清单中）" % addr)
-        else:
-            _log("清理多余地址 %s 失败：%s" % (addr, actions[-1]["msg"]))
-
-    # ---- 阶段二：撤下「已注册但本轮不再需要」的地址 ----
-    # 覆盖：先加新未删旧就重启核心留下的残留、控制台手工增删造成的偏差、
-    # 以及**连不上因此从不出现在 GET 列表里的死记录**。
-    to_clean = (set(out_addrs) | managed_set) - target - protect
+    # 已被阶段一删掉的地址不会重复处理：_del 成功时会从 out_addrs 与
+    # known_db 中移除，to_clean 因此不会再包含它。
+    to_clean = (known_db | set(out_addrs) | managed_set) - target - protect
     for addr in sorted(to_clean):
         if _del(addr, "", "不在配置清单中，已清理"):
             managed_set.discard(addr)

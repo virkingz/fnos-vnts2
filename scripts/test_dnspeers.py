@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import sys
+import sqlite3
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -755,7 +756,158 @@ out, alladdr, err = cl2.list_peers()
 check("控制台不可达时返回错误而非抛异常", out == [] and "无法连接" in err, err)
 
 # ===========================================================================
+# 读核心数据库 + 以库为基准的清理（用户报的场景）
+# ===========================================================================
+# 背景：v2.0.9 实测 —— POST 一个连不上的地址会「添加成功」并写进 SQLite，
+# 但 GET /api/peer_servers 的 outbound 只含当前连上的，所以它**永远不出现
+# 在接口里**（重启核心也不出现：日志有 "Starting outbound connection to"，
+# 但 API 仍为空）。于是「只认本页配置」的对账清不掉这些残留。
+# 解法：只读数据库拿到完整名单，删除仍走 DELETE API。
+
+# 本段需要一个临时目录来验证「库文件不存在」的分支
+tmpdir = tempfile.mkdtemp(prefix="vnts-dnspeers-")
+
+print("\n[19] 只读数据库拿全部已注册地址（用真实 SQLite）")
+
+# 建一个与核心结构完全一致的库：
+#   CREATE TABLE peer_servers (id INTEGER PRIMARY KEY AUTOINCREMENT,
+#       server_addr TEXT NOT NULL UNIQUE, source INTEGER NOT NULL DEFAULT 0,
+#       created_at INTEGER NOT NULL)
+#   —— 取自 vnts2 v2.0.9 的真实建表语句
+db_path = os.path.join(tmpdir, "network_control.db")
+_c = sqlite3.connect(db_path)
+_c.execute("""CREATE TABLE peer_servers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        server_addr TEXT NOT NULL UNIQUE,
+        source INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL)""")
+_c.executemany("INSERT INTO peer_servers (server_addr, source, created_at) VALUES (?,?,?)",
+               [("1.2.3.4:29873", 1, 100), ("5.6.7.8:29873", 1, 200),
+                ("9.9.9.9:29873", 0, 300)])
+_c.commit()
+_c.close()
+
+addrs, err = D.db_peer_addrs(db_path)
+check("读出全部已注册地址（含连不上的）",
+      addrs == ["1.2.3.4:29873", "5.6.7.8:29873", "9.9.9.9:29873"], addrs)
+check("按 created_at 排序", addrs[0] == "1.2.3.4:29873", addrs)
+check("成功时无错误", err == "", err)
+
+# 只读保证：即使代码写错也改不了库（mode=ro 由 SQLite 强制）
+_c = sqlite3.connect(db_path)
+before = _c.execute("SELECT COUNT(*) FROM peer_servers").fetchone()[0]
+_c.close()
+_c = sqlite3.connect(db_path)
+after = _c.execute("SELECT COUNT(*) FROM peer_servers").fetchone()[0]
+_c.close()
+check("读取不改变数据（只读语义）", before == after == 3, (before, after))
+
+# 降级路径
+addrs, err = D.db_peer_addrs("")
+check("库路径为空时安全返回", addrs == [] and err, err)
+addrs, err = D.db_peer_addrs(os.path.join(tmpdir, "nope.db"))
+check("库文件不存在时安全返回", addrs == [] and err, err)
+
+# 表结构异常（如空库）也要安全降级，绝不抛异常
+blank = os.path.join(tmpdir, "blank.db")
+_c = sqlite3.connect(blank)
+_c.execute("CREATE TABLE other (x INTEGER)")
+_c.commit()
+_c.close()
+addrs, err = D.db_peer_addrs(blank)
+check("无 peer_servers 表时安全降级", addrs == [] and err, err)
+
+print("\n[20] 清单为空：连不上的残留也能清掉（用户报的核心场景）")
+
+
+class GhostClient(StubClient):
+    """模拟真实核心：库里有的地址，GET 却看不见（连不上）。"""
+
+    def __init__(self, db_only=None, connected=None):
+        # connected 才出现在 list_peers（GET）里
+        super(GhostClient, self).__init__(addrs=list(connected or []))
+        self._db_only = list(db_only or [])
+
+    def del_peer(self, a):
+        self.calls.append(("del", a))
+        # 真实核心按字符串删库：删不存在的也返回成功
+        if a in self.addrs:
+            self.addrs.remove(a)
+        if a in self._db_only:
+            self._db_only.remove(a)
+        return True, ""
+
+
+# 场景：清单已清空，库里还有 2 条连不上的残留
+gc = GhostClient(db_only=["9.9.9.9:29873", "8.8.8.8:29873"])
+d = D.default_doc()
+d["records"] = []
+d["managed"] = []          # managed 也空了 —— 旧逻辑正是卡在这里
+acts = D.sync_once(d, gc, db_addrs=["9.9.9.9:29873", "8.8.8.8:29873"])
+deleted = sorted(a["addr"] for a in acts if a["action"] == "del")
+check("库里连不上的残留被清掉", deleted == ["8.8.8.8:29873", "9.9.9.9:29873"], deleted)
+check("残留已被真正删除（客户端侧）", gc._db_only == [], gc._db_only)
+
+# 对照：不给 db_addrs（模拟旧行为）就清不掉 —— 说明读取库是必需的
+gc2 = GhostClient(db_only=["9.9.9.9:29873"])
+d2 = D.default_doc()
+d2["records"] = []
+d2["managed"] = []
+acts2 = D.sync_once(d2, gc2)
+check("不传 db_addrs 时确实清不掉（证明必须读库）",
+      not [a for a in acts2 if a["action"] == "del"], acts2)
+
+print("\n[21] 以库为基准：保留清单内的，清掉清单外的")
+
+# 清单要 a.com -> 1.1.1.1；库里有这三条，其中只有目标该留
+gc3 = GhostClient(db_only=["7.7.7.7:29873"])
+d3 = D.default_doc()
+d3["records"] = [rec("a.com", "29873")]
+d3["managed"] = ["1.1.1.1:29873"]        # 上轮已托管
+acts3 = D.sync_once(d3, gc3, _getaddrinfo=gai_map({"a.com": "1.1.1.1"}),
+                    db_addrs=["1.1.1.1:29873", "7.7.7.7:29873"])
+kept = [a for a in acts3 if a["action"] in ("add", "keep")]
+killed = [a["addr"] for a in acts3 if a["action"] == "del"]
+check("目标地址被登记", any(a["addr"] == "1.1.1.1:29873" for a in kept), kept)
+check("清单外的库记录被清掉", "7.7.7.7:29873" in killed, killed)
+
+# 用户手工加的地址（在库里、清单里没有）也一并清掉 —— 这正是「只认本页」
+gc4 = GhostClient(connected=["3.3.3.3:29873"])
+d4 = D.default_doc()
+d4["records"] = [rec("a.com", "29873")]
+acts4 = D.sync_once(d4, gc4, _getaddrinfo=gai_map({"a.com": "1.1.1.1"}),
+                    db_addrs=["3.3.3.3:29873"])
+killed4 = [a["addr"] for a in acts4 if a["action"] == "del"]
+check("控制台手工加的（清单外）被撤下", "3.3.3.3:29873" in killed4, killed4)
+
+print("\n[22] 安全约束：解析失败时绝不动旧地址")
+
+gc5 = GhostClient(db_only=["1.1.1.1:29873", "6.6.6.6:29873"])
+d5 = D.default_doc()
+d5["records"] = [rec("a.com", "29873", cur="1.1.1.1:29873")]
+d5["managed"] = ["1.1.1.1:29873"]
+# 域名解析失败 -> 目标沿用 current(1.1.1.1) -> 它必须保留
+acts5 = D.sync_once(d5, gc5, _getaddrinfo=gai_map({}),
+                    db_addrs=["1.1.1.1:29873", "6.6.6.6:29873"])
+killed5 = [a["addr"] for a in acts5 if a["action"] == "del"]
+check("解析失败时旧地址不被删", "1.1.1.1:29873" not in killed5, killed5)
+check("同轮仍会清掉无关残留", "6.6.6.6:29873" in killed5, killed5)
+
+print("\n[23] add 失败时保护旧地址（不被误删）")
+
+gc6 = GhostClient()
+gc6.fail_add = True
+d6 = D.default_doc()
+d6["records"] = [rec("a.com", "29873", cur="1.1.1.1:29873")]
+d6["managed"] = ["1.1.1.1:29873"]
+acts6 = D.sync_once(d6, gc6, _getaddrinfo=gai_map({"a.com": "2.2.2.2"}),
+                    db_addrs=["1.1.1.1:29873"])
+killed6 = [a["addr"] for a in acts6 if a["action"] == "del"]
+check("add 失败时不删旧地址（互联不断）", "1.1.1.1:29873" not in killed6, killed6)
+
+# ===========================================================================
 print("\n" + "=" * 66)
+
 print("通过 %d 项，失败 %d 项" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
 

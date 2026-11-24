@@ -358,24 +358,37 @@ def sync_dns_peers(once=False, log_prefix="域名同步"):
 
     返回 {"ok":bool, "actions":[...], "error":str}。
 
-    **清单为空不等于什么都不做**：若此前托管过地址（doc["managed"] 非空），
-    本轮负责把它们从核心撤下 —— 这是「从有到无」必须生效的路径。
-    只有在「清单为空且从未托管过任何地址」时才是真正的空转（skipped）。
+    **清单为空不等于什么都不做**：只要核心数据库里还有「已注册的出站地址」
+    （含连不上、因而从不出现在接口里的那些），本轮就要把它们撤下 ——
+    这是「从有到无」必须生效的路径，也是「只认本页配置」的落点。
+
+    只有在「清单为空、无待撤地址、且核心库里也确实没有出站地址」时，
+    才是真正的空转（skipped）。
     """
     doc = load_dns_doc()
-    if not doc.get("records") and not doc.get("managed"):
-        return {"ok": True, "actions": [], "skipped": True, "error": ""}
     if not core_running():
         return {"ok": False, "actions": [], "error": "核心未运行，暂不同步"}
 
     with _dns_lock:
         # 重新读一次：可能刚被界面改过
         doc = load_dns_doc()
-        if not doc.get("records") and not doc.get("managed"):
+        # 读核心数据库拿「全部已注册地址」—— 含连不上、因而**永不出现
+        # 在 GET /api/peer_servers 里**的那些。不读它就清不干净（见
+        # dns_peers.db_peer_addrs 的说明）。只读打开，失败则降级为
+        # 只用 API 能看到的地址，不影响主流程。
+        db_addrs, db_err = DP.db_peer_addrs(SERVER_DB)
+        if db_err:
+            log("读取核心数据库失败，降级为仅用接口可见的地址：%s" % db_err)
+
+        # 空转判定：清单空、且没有待撤的托管地址、且库里也没有出站记录。
+        # 注意 db_addrs 为空**不等于**库里没有（可能只是读失败），
+        # 所以仅当读取成功且确实为空时才跳过。
+        if (not doc.get("records") and not doc.get("managed")
+                and not db_addrs and not db_err):
             return {"ok": True, "actions": [], "skipped": True, "error": ""}
         try:
             client = _console_client()
-            actions = DP.sync_once(doc, client, log=log)
+            actions = DP.sync_once(doc, client, log=log, db_addrs=db_addrs)
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "actions": [], "error": "同步异常: %s" % e}
         try:
@@ -430,16 +443,26 @@ def set_dns_peers(hosts, interval=None):
 def dns_sync_loop(stop_event):
     """后台轮询线程。
 
-    只要「还有清单」或「还有待撤下的托管地址」就同步；两者都空则空转等待，
-    不做任何网络请求。清理成功后 managed 会归空，线程自然转入空转，不会空转
-    发起请求。
+    只要「还有清单」「还有待撤下的托管地址」或「核心库里还留有出站地址」
+    就同步；都为空则空转等待，不做任何网络请求。
+
+    为什么要连库里的残留一起看：连不上的地址会写进库，却**永远不出现在
+    GET /api/peer_servers 里**（实测重启核心也不会出现）。若只按 records /
+    managed 判断，这些残留会让循环永远空转、永远清不掉 —— 这正是
+    「只认本页配置」失效的原因。
     """
     while not stop_event.is_set():
         interval = DP.DEFAULT_INTERVAL
         try:
             doc = load_dns_doc()
             interval = doc.get("interval") or DP.DEFAULT_INTERVAL
-            if doc.get("records") or doc.get("managed"):
+            need = bool(doc.get("records") or doc.get("managed"))
+            if not need:
+                # 清单为空时，只有库里有残留才需要再跑一轮（清理）。
+                # 读取失败则保守地跑一轮，交给 sync 内部降级处理。
+                addrs, derr = DP.db_peer_addrs(SERVER_DB)
+                need = bool(addrs) or bool(derr)
+            if need:
                 sync_dns_peers()
         except Exception as e:  # noqa: BLE001
             log("域名轮询异常: %s" % e)
@@ -1944,4 +1967,13 @@ def bootstrap():
     log("bootstrap: %s" % msg)
     if ok:
         mark_autostart(True)
+        # 核心刚起来，立刻对账一次：把库里残留的出站地址（尤其是连不上、
+        # 从不出现在接口里的那些）按本页清单清干净，再写入解析后的目标。
+        # 放在核心启动之后是因为同步要走控制台 API（需要核心在线）。
+        try:
+            res = sync_dns_peers(log_prefix="域名同步（启动后）")
+            if res.get("actions"):
+                log("启动后同步：%s" % (res.get("error") or "已完成"))
+        except Exception as e:  # noqa: BLE001
+            log("启动后同步失败（不影响核心运行）：%s" % e)
         # 域名同步由 start_core() 内部负责，这里不再重复
